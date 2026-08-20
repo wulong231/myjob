@@ -1,0 +1,33 @@
+# 运行时数据
+.bili23/
+config/
+downloads/
+transfer/
+
+# 构建产物
+build/
+dist/
+*.spec
+*.exe
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 测试/调试脚本
+test_*.py
+debug_*.py
+check_*.py
+diagnose.py
+*.html
+
+# 备份与旧配置文件
+cookie_backup.json
+config.json
+
+# 系统
+*.log
+.DS_Store
+Thumbs.db

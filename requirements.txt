@@ -1,0 +1,5 @@
+requests>=2.31.0
+ffmpeg-python>=0.2.0
+tqdm>=4.66.0
+cryptography>=42.0.0
+websocket-client>=1.6.0
