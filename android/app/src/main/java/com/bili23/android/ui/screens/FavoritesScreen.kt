@@ -27,6 +27,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -58,6 +59,8 @@ fun FavoritesScreen(navController: NavHostController, vm: AppViewModel = viewMod
     val folders by vm.favoriteFolders.collectAsState()
     val videos by vm.favoriteVideos.collectAsState()
     val loading by vm.favLoading.collectAsState()
+    val loadingMore by vm.favLoadingMore.collectAsState()
+    val hasMore by vm.favHasMore.collectAsState()
     var selectedFolder by remember { mutableLongStateOf(-1L) }
 
     LaunchedEffect(Unit) {
@@ -134,6 +137,42 @@ fun FavoritesScreen(navController: NavHostController, vm: AppViewModel = viewMod
                     items(videos, key = { it.bvid }) { video ->
                         FavoriteVideoItem(video) {
                             navController.navigate("detail/${video.bvid}")
+                        }
+                    }
+                    item {
+                        if (loadingMore) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                            }
+                        } else if (hasMore) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                OutlinedButton(onClick = { vm.loadMoreFavoriteVideos() }) {
+                                    Text("下一页")
+                                }
+                            }
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "已加载全部",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }

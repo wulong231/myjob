@@ -468,16 +468,17 @@ class BiliApi(private val okHttp: OkHttpClient) {
         }
     }
 
-    /** 获取收藏夹内的视频列表 */
-    suspend fun getFavoriteVideos(folderId: Long, page: Int = 1): List<VideoInfo> =
+    /** 获取收藏夹内的视频列表（分页） */
+    suspend fun getFavoriteVideos(folderId: Long, page: Int = 1): FavoriteVideoPage =
         withContext(Dispatchers.IO) {
-            if (Settings.cookie.isBlank()) return@withContext emptyList()
+            if (Settings.cookie.isBlank()) return@withContext FavoriteVideoPage()
             try {
                 val resp = fetchJson(
                     "$API_BASE/x/v3/fav/resource/list?media_id=$folderId&pn=$page&ps=20&platform=web&order=mtime"
                 )
-                if (resp.optInt("code") != 0) return@withContext emptyList()
-                val list = resp.optJSONObject("data")?.optJSONArray("medias") ?: return@withContext emptyList()
+                if (resp.optInt("code") != 0) return@withContext FavoriteVideoPage()
+                val data = resp.optJSONObject("data") ?: return@withContext FavoriteVideoPage()
+                val list = data.optJSONArray("medias") ?: return@withContext FavoriteVideoPage()
                 val videos = mutableListOf<VideoInfo>()
                 for (i in 0 until list.length()) {
                     val m = list.optJSONObject(i) ?: continue
@@ -495,9 +496,13 @@ class BiliApi(private val okHttp: OkHttpClient) {
                         )
                     )
                 }
-                videos
+                FavoriteVideoPage(
+                    videos = videos,
+                    page = page,
+                    hasMore = data.optInt("has_more") == 1
+                )
             } catch (_: Exception) {
-                emptyList()
+                FavoriteVideoPage()
             }
         }
 }

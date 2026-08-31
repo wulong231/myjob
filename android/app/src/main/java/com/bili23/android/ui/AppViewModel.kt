@@ -540,6 +540,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val favoriteVideos: StateFlow<List<VideoInfo>> get() = _favoriteVideos
     private val _favLoading = MutableStateFlow(false)
     val favLoading: StateFlow<Boolean> get() = _favLoading
+    private val _favLoadingMore = MutableStateFlow(false)
+    val favLoadingMore: StateFlow<Boolean> get() = _favLoadingMore
+    private val _favHasMore = MutableStateFlow(false)
+    val favHasMore: StateFlow<Boolean> get() = _favHasMore
+    private val _favPage = MutableStateFlow(1)
+    private val _favFolderId = MutableStateFlow(-1L)
 
     fun loadFavoriteFolders() {
         val mid = _loginUser.value?.mid ?: return
@@ -550,11 +556,32 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 加载指定收藏夹的第一页视频（切换收藏夹时重置分页状态） */
     fun loadFavoriteVideos(folderId: Long) {
+        _favFolderId.value = folderId
+        _favPage.value = 1
         viewModelScope.launch {
             _favLoading.value = true
-            _favoriteVideos.value = api.getFavoriteVideos(folderId)
+            _favoriteVideos.value = emptyList()
+            val page = api.getFavoriteVideos(folderId, 1)
+            _favoriteVideos.value = page.videos
+            _favHasMore.value = page.hasMore
             _favLoading.value = false
+        }
+    }
+
+    /** 加载收藏夹的下一页视频并追加到列表 */
+    fun loadMoreFavoriteVideos() {
+        val folderId = _favFolderId.value
+        if (folderId < 0 || !_favHasMore.value || _favLoading.value || _favLoadingMore.value) return
+        viewModelScope.launch {
+            _favLoadingMore.value = true
+            val next = _favPage.value + 1
+            val page = api.getFavoriteVideos(folderId, next)
+            _favoriteVideos.value = _favoriteVideos.value + page.videos
+            _favHasMore.value = page.hasMore
+            _favPage.value = next
+            _favLoadingMore.value = false
         }
     }
 

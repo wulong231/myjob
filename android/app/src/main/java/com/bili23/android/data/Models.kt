@@ -38,6 +38,13 @@ data class SearchResult(
     val hasMore: Boolean = false
 )
 
+/** 收藏夹内视频分页结果 */
+data class FavoriteVideoPage(
+    val videos: List<VideoInfo> = emptyList(),
+    val page: Int = 1,
+    val hasMore: Boolean = false
+)
+
 /** DASH 播放地址 */
 data class PlayUrl(
     val quality: Int = 0,
