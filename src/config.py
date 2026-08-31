@@ -83,7 +83,7 @@ class AppConfig(QConfig):
         EnumSerializer(Language)
     )
     theme = OptionsConfigItem(
-        "General", "Theme", Theme.LIGHT,
+        "General", "Theme", Theme.AUTO,
         OptionsValidator([Theme.LIGHT, Theme.DARK, Theme.AUTO]),
         EnumSerializer(Theme)
     )
@@ -189,6 +189,15 @@ class AppConfig(QConfig):
         "Audio", "GlobalHotkeys",
         '{"play_pause": "ctrl+alt+space", "prev": "ctrl+alt+left", "next": "ctrl+alt+right", "vol_up": "ctrl+alt+up", "vol_down": "ctrl+alt+down"}'
     )
+    # DeepSeek API Key（用于 AI 歌词翻译）
+    deepseek_api_key = ConfigItem("Audio", "DeepSeekApiKey", "")
+    # 百度翻译 AppID
+    baidu_translate_appid = ConfigItem("Audio", "BaiduAppId", "20260731002656664")
+    # 百度翻译密钥
+    baidu_translate_secret = ConfigItem("Audio", "BaiduSecret", "TgtzQWT7ppHS4ZLtWj_T")
+
+    # 视频播放器偏好
+    video_auto_play = ConfigItem("Video", "AutoPlay", True, BoolValidator())
 
     def __init__(self):
         super().__init__()

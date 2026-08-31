@@ -1,20 +1,21 @@
 """快捷键编辑对话框"""
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QWidget, QKeyEvent
+    QWidget,
 )
 from qfluentwidgets import (
     SimpleCardWidget, SubtitleLabel, BodyLabel, CaptionLabel,
     PrimaryPushButton, PushButton
 )
-from ..config import cfg
+from ..config import get_config
 
 
 class KeyCaptureEdit(QLineEdit):
     """按键捕获输入框：点击后按下的组合键会被记录"""
 
-    keyCaptured = Qt.Signal(str)
+    keyCaptured = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -119,7 +120,7 @@ class HotkeyDialog(QDialog):
         layout.addWidget(desc)
 
         try:
-            self._hk = _json.loads(cfg().get(cfg().global_hotkeys))
+            self._hk = _json.loads(get_config().get(get_config().global_hotkeys))
         except Exception:
             self._hk = {
                 "play_pause": "ctrl+alt+space",
@@ -190,5 +191,6 @@ class HotkeyDialog(QDialog):
             val = edit.text().strip()
             if val:
                 new_hk[key] = val
-        cfg().set(cfg().global_hotkeys, _json.dumps(new_hk))
+        cfg = get_config()
+        cfg.set(cfg.global_hotkeys, _json.dumps(new_hk))
         self.accept()

@@ -31,3 +31,23 @@ config.json
 *.log
 .DS_Store
 Thumbs.db
+
+# Android 工具链 / SDK / Gradle 缓存（体积巨大，不入库）
+android-sdk/
+gradle-dist/
+venv/
+
+# Android 工程
+android/.gradle/
+android/.kotlin/
+android/.idea/
+android/build/
+android/captures/
+android/local.properties
+android/keystore/
+android/Bili23-release.apk
+*.iml
+
+# 安装包 / APK 产物
+安装包/
+*.apk

@@ -143,6 +143,23 @@ def ensure_python_deps() -> bool:
         return True
 
     logger.info(f"检测到缺失依赖: {', '.join(missing)}，尝试自动安装...")
+
+    # 先确保 pip 可用
+    try:
+        import ensurepip
+        ensurepip.bootstrap()
+    except Exception:
+        pass
+
+    # 尝试升级 pip 本身
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
+            capture_output=True, text=True, timeout=60
+        )
+    except Exception:
+        pass
+
     try:
         subprocess.run(
             [sys.executable, "-m", "pip", "install"] + missing,

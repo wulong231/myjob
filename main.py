@@ -44,6 +44,10 @@ def setup_logging():
 
 def main():
     """主入口"""
+    # 必须在任何其他操作之前设置全局异常钩子
+    from src.utils import setup_global_exception_hook
+    setup_global_exception_hook()
+
     setup_logging()
     logger = logging.getLogger(__name__)
 

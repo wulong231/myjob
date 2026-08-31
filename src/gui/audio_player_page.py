@@ -11,16 +11,18 @@ import logging
 import random
 import hashlib
 from typing import List, Optional, Dict, Tuple
-from datetime import datetime, timedelta
-from collections import Counter
+import os
+
+from ..utils import scandir_recursive, retry, safe_delete, safe_rmdir
 
 from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QPoint, QRect, QSize, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QThread
 from PySide6.QtGui import QPixmap, QImage, QColor, QAction, QKeySequence, QShortcut, QPainter, QFont, QBrush, QPen, QLinearGradient, QPalette, QTransform, QIcon
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QFileDialog, QSizePolicy, QMenu, QSplitter, QMessageBox, QInputDialog,
-    QCheckBox, QGridLayout, QFrame, QApplication, QDialog, QTextEdit,
+    QCheckBox, QGridLayout, QFrame, QApplication, QDialog,
     QSlider as QSliderWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QStyledItemDelegate, QStyleOptionViewItem,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from qfluentwidgets import (
@@ -32,189 +34,16 @@ from qfluentwidgets import (
 )
 
 from ..config import get_config
+from .equalizer_dialog import EqualizerDialog
+from .desktop_lyrics import DesktopLyrics
+from .lyrics_widget import LyricsWidget
+from .widgets import _SyncToTransferWorker, RotatingCoverLabel, _AudioLevelWorker, _extract_metadata
+from .translate_worker import _TranslateWorker
+from .lyrics_editor_dialog import LyricsEditorDialog
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# 歌词翻译（联网）
-# ============================================================
-class _TranslateWorker(QThread):
-    """异步翻译歌词线程（多服务容错，AI 优先）"""
-    finished = Signal(str, list)  # (source_path, translated_lines)
-    error = Signal(str, str)      # (source_path, error_msg)
 
-    def __init__(self, lines: list, source: str = "auto", target: str = "zh", parent=None):
-        super().__init__(parent)
-        self._lines = lines
-        self._source = source
-        self._target = target
-
-    def run(self):
-        # 批量翻译（整段发送给 AI，获得更好的上下文理解）
-        original_text = "\n".join(self._lines)
-        try:
-            # 优先使用 AI 批量翻译
-            from ..network import get_client
-            client = get_client()
-            translated = self._ai_batch_translate(original_text, client)
-            if translated:
-                results = translated.split("\n")
-                # 确保结果行数与原文一致
-                while len(results) < len(self._lines):
-                    results.append("")
-                self.finished.emit("", results[:len(self._lines)])
-                return
-        except Exception:
-            pass
-
-        # AI 翻译失败，降级到逐行翻译
-        import urllib.parse
-        import urllib.request
-        import json as _json
-
-        translated = []
-        fail_count = 0
-
-        for line in self._lines:
-            if not line.strip():
-                translated.append("")
-                continue
-            try:
-                result = self._translate_single(line, urllib.parse, urllib.request, _json)
-                translated.append(result)
-            except Exception:
-                translated.append(line)
-                fail_count += 1
-
-        if fail_count == len(self._lines):
-            self.error.emit("", "翻译服务不可用，请检查网络连接")
-        else:
-            self.finished.emit("", translated)
-
-    def _ai_batch_translate(self, text: str, client) -> str:
-        """AI 批量翻译（整段发送，上下文更准确）"""
-        # 服务1: MyMemory API（免费，无需密钥，国内可访问）
-        import urllib.parse
-        url = "https://api.mymemory.translated.net/get"
-        source_lang = self._source if self._source != "auto" else "ja"
-        resp = client.get(url, params={
-            "q": text[:500],  # MyMemory 有长度限制
-            "langpair": f"{source_lang}|zh-CN"
-        }, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            result = data.get("responseData", {}).get("translatedText", "")
-            if result:
-                # 替换 MyMemory 的占位符和警告
-                result = result.replace("MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS FOR TODAY. NEXT AVAILABLE IN  06 HOURS 00 MINUTES 00 SECONDS", "").strip()
-                if result:
-                    return result
-
-        # 服务2: 批量翻译失败，返回空让调用方降级到逐行
-        return ""
-
-    def _translate_single(self, text, urllib_parse, urllib_request, _json):
-        """翻译单行文本，依次尝试多个翻译服务"""
-        # 服务1: MyMemory API
-        try:
-            result = self._mymemory_translate(text, urllib_parse, urllib_request, _json)
-            if result and result.strip():
-                return result.strip()
-        except Exception:
-            pass
-
-        # 服务2: Google Translate Web API
-        try:
-            result = self._google_translate_web(text, urllib_parse, urllib_request, _json)
-            if result and result.strip():
-                return result.strip()
-        except Exception:
-            pass
-
-        # 服务3: 百度翻译API（已有密钥）
-        try:
-            result = self._baidu_translate(text, urllib_parse, urllib_request, _json)
-            if result and result.strip():
-                return result.strip()
-        except Exception:
-            pass
-
-        return text  # 所有服务失败，返回原文
-
-    def _baidu_translate(self, text, urllib_parse, urllib_request, _json):
-        import hashlib
-        import random
-
-        appid = "20260731002656664"
-        secret_key = "TgtzQWT7ppHS4ZLtWj_T"
-
-        salt = str(random.randint(32768, 65536))
-        sign = hashlib.md5((appid + text + salt + secret_key).encode("utf-8")).hexdigest()
-
-        url = "https://fanyi-api.baidu.com/api/trans/vip/translate"
-        params = {
-            "q": text,
-            "from": self._source,
-            "to": self._target,
-            "appid": appid,
-            "salt": salt,
-            "sign": sign,
-        }
-        full_url = f"{url}?{urllib_parse.urlencode(params)}"
-        req = urllib_request.Request(full_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
-
-        with urllib_request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-            if "trans_result" in data:
-                return "".join([item["dst"] for item in data["trans_result"]])
-            elif "error_code" in data:
-                error_msg = data.get("error_msg", "未知错误")
-                raise Exception(f"百度翻译API错误 ({data['error_code']}): {error_msg}")
-            return ""
-
-    def _google_translate_web(self, text, urllib_parse, urllib_request, _json):
-        """Google Translate Web API（免费，无需密钥）"""
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = urllib_parse.urlencode({
-            "client": "gtx",
-            "sl": self._source if self._source != "auto" else "auto",
-            "tl": self._target,
-            "dt": "t",
-            "q": text,
-        })
-        full_url = f"{url}?{params}"
-        req = urllib_request.Request(full_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        })
-        with urllib_request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-            if data and data[0]:
-                parts = []
-                for seg in data[0]:
-                    if seg and seg[0]:
-                        parts.append(seg[0])
-                return "".join(parts)
-
-    def _mymemory_translate(self, text, urllib_parse, urllib_request, _json):
-        """MyMemory 翻译 API（免费，国内可访问）"""
-        source_lang = self._source if self._source != "auto" else "en"
-        lang_pair = f"{source_lang}|zh-CN"
-        url = f"https://api.mymemory.translated.net/get?q={urllib_parse.quote(text)}&langpair={lang_pair}"
-        req = urllib_request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        with urllib_request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-            result = data.get("responseData", {}).get("translatedText", "")
-            if result:
-                # 过滤 MyMemory 的每日限额警告
-                idx = result.find("MYMEMORY WARNING")
-                if idx >= 0:
-                    result = result[:idx].strip()
-                return result
-            return ""
 AUDIO_EXTENSIONS = ('.mp3', '.m4a', '.flac', '.wav', '.aac', '.opus')
 
 PLAYBACK_RATES = ["0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "1.75x", "2.0x"]
@@ -234,19 +63,6 @@ PLAY_MODE_NAMES = {
     PLAY_MODE_SINGLE: "单曲循环",
     PLAY_MODE_RANDOM: "随机播放",
 }
-
-# ---------- EQ 预设 ----------
-EQ_PRESETS: Dict[str, List[int]] = {
-    "平直":   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    "流行":   [+3, +1, +0, +2, +3, +3, +2, +1, +0, +1],
-    "摇滚":   [+4, +3, +2, -1, -2, +1, +3, +4, +4, +4],
-    "古典":   [+4, +3, +2, +0, -1, -1, +0, +2, +3, +4],
-    "爵士":   [+3, +2, +1, +2, -1, -1, +0, +1, +2, +3],
-    "电子":   [+4, +3, +0, +0, -2, +2, +4, +4, +4, +4],
-    "人声":   [-2, -1, +0, +2, +4, +4, +3, +1, +0, -1],
-}
-EQ_BANDS = ["31Hz", "62Hz", "125Hz", "250Hz", "500Hz",
-            "1kHz", "2kHz", "4kHz", "8kHz", "16kHz"]
 
 
 def _format_time(ms: int) -> str:
@@ -318,216 +134,9 @@ def _extract_cover_from_audio(audio_path: str) -> Optional[bytes]:
     return None
 
 
-def _extract_metadata(audio_path: str) -> Dict[str, str]:
-    """提取音频元数据 (title, artist, album)。
-    - MP3 (.mp3): 使用 mutagen.mp3.MP3 + TIT2/TPE1/TALB 帧
-    - M4A/MP4 (.m4a, .mp4): 使用 mutagen.mp4.MP4 的 '\xa9nam' / '\xa9ART' / '\xa9alb' 原子
-    - FLAC (.flac): 使用 mutagen.flac.FLAC 的 vorbis 注释
-    - OGG/OPUS/WAV/其他: 走通用 MutagenFile + 字符串 key
-    读取完成后立即释放本地引用，避免 Windows 文件句柄占用导致后续 move 失败。
-    """
-    meta = {'title': '', 'artist': '', 'album': ''}
-    if not audio_path or not os.path.isfile(audio_path):
-        return meta
-    ext = os.path.splitext(audio_path)[1].lower()
-    try:
-        if ext == '.mp3':
-            from mutagen.mp3 import MP3 as _MP3
-            audio = _MP3(audio_path)
-            def _mp3_get(id3_key: str) -> str:
-                if audio.tags and id3_key in audio.tags:
-                    f = audio.tags[id3_key]
-                    if hasattr(f, 'text') and f.text:
-                        return str(f.text[0])
-                return ''
-            meta['title']  = _mp3_get('TIT2')
-            meta['artist'] = _mp3_get('TPE1')
-            meta['album']  = _mp3_get('TALB')
-            try:
-                if hasattr(audio, 'filename'):
-                    audio.filename = None
-                del audio
-            except Exception:
-                pass
-        elif ext in ('.m4a', '.mp4'):
-            from mutagen.mp4 import MP4 as _MP4
-            audio = _MP4(audio_path)
-            mp4_map = {'title': '\xa9nam', 'artist': '\xa9ART', 'album': '\xa9alb'}
-            for k, atom in mp4_map.items():
-                v = audio.get(atom, '')
-                if isinstance(v, list):
-                    meta[k] = str(v[0]) if v else ''
-                else:
-                    meta[k] = str(v) if v else ''
-            try:
-                del audio
-            except Exception:
-                pass
-        elif ext == '.flac':
-            from mutagen.flac import FLAC as _FLAC
-            audio = _FLAC(audio_path)
-            for k in ('title', 'artist', 'album'):
-                v = audio.get(k, '')
-                if isinstance(v, list):
-                    meta[k] = str(v[0]) if v else ''
-                else:
-                    meta[k] = str(v) if v else ''
-            try:
-                del audio
-            except Exception:
-                pass
-        else:
-            # OGG / OPUS / WAV / 其他 → 走通用 MutagenFile
-            from mutagen import File as _MF
-            audio = _MF(audio_path)
-            if audio is not None:
-                for k in ('title', 'artist', 'album'):
-                    v = audio.get(k, '')
-                    if isinstance(v, list):
-                        meta[k] = str(v[0]) if v else ''
-                    else:
-                        meta[k] = str(v) if v else ''
-            try:
-                if audio is not None:
-                    del audio
-            except Exception:
-                pass
-
-        for k, v in list(meta.items()):
-            if not v or v == '[]':
-                meta[k] = ''
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.debug(f"提取元数据失败 {audio_path}: {e}")
-    return meta
-
-
 # ============================================================
 # 同步到音乐库工作线程
 # ============================================================
-class _SyncToTransferWorker(QThread):
-    """后台同步音频和歌词到 transfer 目录（排除重复）"""
-    finished = Signal(int, int, int)  # (copied, skipped, errors)
-
-    def __init__(self, playlist: List[str], transfer_path: str, parent=None):
-        super().__init__(parent)
-        self._playlist = playlist
-        self._transfer_path = transfer_path
-
-    def run(self):
-        import shutil
-        import hashlib
-        os.makedirs(self._transfer_path, exist_ok=True)
-
-        copied = 0
-        skipped = 0
-        errors = 0
-
-        # 预扫描目标目录，建立已有文件索引（文件名 -> (大小, md5)）
-        existing_files = {}
-        for fname in os.listdir(self._transfer_path):
-            fpath = os.path.join(self._transfer_path, fname)
-            if os.path.isfile(fpath):
-                try:
-                    existing_files[fname] = (os.path.getsize(fpath), None)
-                except Exception:
-                    pass
-
-        for audio_path in self._playlist:
-            if not os.path.isfile(audio_path):
-                errors += 1
-                continue
-
-            try:
-                # 获取元数据，按"歌名 - 歌手"命名
-                meta = _extract_metadata(audio_path)
-                title = meta.get('title', '')
-                artist = meta.get('artist', '')
-                ext = os.path.splitext(audio_path)[1]
-
-                if title and artist:
-                    dest_name = f"{title} - {artist}{ext}"
-                elif title:
-                    dest_name = f"{title}{ext}"
-                else:
-                    dest_name = os.path.basename(audio_path)
-
-                # 清理文件名中的非法字符
-                dest_name = self._sanitize_filename(dest_name)
-                dest_path = os.path.join(self._transfer_path, dest_name)
-
-                # 去重检查：文件名 + 大小 + MD5
-                src_size = os.path.getsize(audio_path)
-                if dest_name in existing_files:
-                    dest_size, dest_md5 = existing_files[dest_name]
-                    if dest_size == src_size:
-                        # 大小相同，进一步校验 MD5
-                        if dest_md5 is None:
-                            dest_md5 = self._file_md5(dest_path)
-                            existing_files[dest_name] = (dest_size, dest_md5)
-                        src_md5 = self._file_md5(audio_path)
-                        if dest_md5 == src_md5:
-                            skipped += 1
-                            # 仍然尝试复制歌词（歌词可能不存在）
-                            self._copy_lyrics(audio_path, dest_name)
-                            continue
-
-                shutil.copy2(audio_path, dest_path)
-                copied += 1
-                # 更新索引
-                existing_files[dest_name] = (src_size, None)
-
-                # 同时复制同名 .lrc 和 .zh.lrc 歌词文件
-                self._copy_lyrics(audio_path, dest_name)
-
-            except Exception as e:
-                logger.warning(f"同步文件失败 {audio_path}: {e}")
-                errors += 1
-
-        self.finished.emit(copied, skipped, errors)
-
-    @staticmethod
-    def _file_md5(path: str, chunk_size: int = 8192) -> str:
-        """计算文件 MD5 值"""
-        import hashlib
-        md5 = hashlib.md5()
-        with open(path, 'rb') as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                md5.update(chunk)
-        return md5.hexdigest()
-
-    def _copy_lyrics(self, audio_path: str, dest_audio_name: str):
-        """复制同名歌词文件到目标目录（排除重复）"""
-        import shutil
-        base = os.path.splitext(audio_path)[0]
-        dest_base = os.path.splitext(dest_audio_name)[0]
-
-        for suffix in ('.lrc', '.zh.lrc'):
-            src_lrc = base + suffix
-            if os.path.isfile(src_lrc):
-                dest_lrc = os.path.join(self._transfer_path, dest_base + suffix)
-                if os.path.isfile(dest_lrc):
-                    # 大小相同则跳过
-                    if os.path.getsize(dest_lrc) == os.path.getsize(src_lrc):
-                        continue
-                try:
-                    shutil.copy2(src_lrc, dest_lrc)
-                except Exception as e:
-                    logger.debug(f"复制歌词失败 {src_lrc}: {e}")
-
-    @staticmethod
-    def _sanitize_filename(name: str) -> str:
-        """移除文件名中的非法字符"""
-        illegal = r'<>:"/\|?*'
-        for ch in illegal:
-            name = name.replace(ch, '')
-        # 去除首尾空格和点号
-        name = name.strip(' .')
-        return name or 'untitled'
 
 
 # ============================================================
@@ -556,917 +165,6 @@ def _make_heart_icon(filled: bool, color: str = "#FF4757") -> QIcon:
     renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
-
-
-# ============================================================
-# 旋转封面组件
-# ============================================================
-class RotatingCoverLabel(QLabel):
-    """可旋转的封面图组件，播放时缓慢旋转"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._angle: float = 0.0
-        self._pixmap: Optional[QPixmap] = None
-        self._is_playing: bool = False
-        # 加大封面显示尺寸，配合 200x200 高清 pixmap 更清晰
-        self.setFixedSize(160, 160)
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background: transparent; border-radius: 80px;")
-        self.setText("🎵")
-
-        self._timer = QTimer(self)
-        self._timer.setInterval(50)  # 20fps
-        self._timer.timeout.connect(self._on_tick)
-
-    def set_pixmap(self, pixmap: QPixmap):
-        """设置封面图并启动旋转"""
-        self._pixmap = pixmap
-        self._angle = 0.0
-        self.update()
-
-    def set_playing(self, playing: bool):
-        """播放/暂停旋转"""
-        self._is_playing = playing
-        if playing and self._pixmap:
-            self._timer.start()
-        else:
-            self._timer.stop()
-            self.update()
-
-    def _on_tick(self):
-        self._angle = (self._angle + 0.5) % 360
-        self.update()
-
-    def paintEvent(self, event):
-        if self._pixmap is None or self._pixmap.isNull():
-            # 无封面图时，绘制带渐变背景的圆形 + 音符图标
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-            rect = self.rect()
-            gradient = QLinearGradient(0, 0, rect.width(), rect.height())
-            gradient.setColorAt(0, QColor("#667EEA"))
-            gradient.setColorAt(1, QColor("#764BA2"))
-            painter.setBrush(QBrush(gradient))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(rect.adjusted(2, 2, -2, -2))
-            painter.setPen(QPen(QColor(255, 255, 255, 200)))
-            font = QFont("Segoe UI Emoji", 28)
-            painter.setFont(font)
-            painter.drawText(rect, Qt.AlignCenter, "🎵")
-            return
-
-        # 有封面图时，旋转绘制
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-
-        # 圆形裁剪
-        path_rect = self.rect()
-        painter.setClipRect(path_rect)
-
-        # 绘制旋转的封面
-        transform = painter.transform()
-        center = self.rect().center()
-        transform.translate(center.x(), center.y())
-        transform.rotate(self._angle)
-        transform.translate(-center.x(), -center.y())
-        painter.setTransform(transform)
-
-        # 圆形遮罩
-        painter.setBrush(QBrush(self._pixmap.scaled(
-            self.width(), self.height(),
-            Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
-        )))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(self.rect().adjusted(4, 4, -4, -4))
-
-        # 绘制中心圆点（黑胶效果）
-        painter.setTransform(QTransform())  # 重置变换
-        painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
-        painter.setPen(QPen(QColor(200, 200, 200), 1))
-        center = self.rect().center()
-        painter.drawEllipse(center, 8, 8)
-        painter.setBrush(QBrush(QColor(80, 80, 80)))
-        painter.drawEllipse(center, 3, 3)
-
-
-# ============================================================
-# 歌词显示组件
-# ============================================================
-class LyricsWidget(QWidget):
-    """歌词滚动显示组件，支持原文/双语/翻译三种显示模式"""
-    # 显示模式
-    MODE_ORIGINAL = "original"     # 仅原文
-    MODE_TRANSLATED = "translated" # 仅翻译
-    MODE_BILINGUAL = "bilingual"   # 双语
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._lyrics: List[Tuple[float, str]] = []
-        self._translated_lyrics: List[str] = []  # 翻译后的歌词（与 _lyrics 一一对应）
-        self._current_line: int = -1
-        self._display_mode = self.MODE_ORIGINAL
-        self._setup_ui()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        self._list = QListWidget(self)
-        # 歌词列表样式：不硬编码颜色，让主题自动适配
-        self._apply_list_style()
-        self._list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._list.setSelectionMode(QListWidget.NoSelection)
-        self._list.setUniformItemSizes(False)
-        layout.addWidget(self._list)
-
-        self._hint = CaptionLabel("暂无歌词")
-        self._hint.setAlignment(Qt.AlignCenter)
-        # 不硬编码颜色，让 CaptionLabel 自动跟随主题
-        self._hint.setStyleSheet("padding: 20px;")
-        layout.addWidget(self._hint)
-
-    def _apply_list_style(self):
-        """根据当前主题应用歌词列表样式"""
-        if isDarkTheme():
-            list_ss = """
-                QListWidget {
-                    background: transparent;
-                    border: none;
-                    outline: none;
-                }
-                QListWidget::item {
-                    padding: 8px 12px;
-                    text-align: center;
-                    font-size: 14px;
-                    color: #C0C0C0;
-                }
-                QListWidget::item:selected {
-                    color: #4DB8FF;
-                    font-size: 16px;
-                    font-weight: bold;
-                }
-            """
-        else:
-            list_ss = """
-                QListWidget {
-                    background: transparent;
-                    border: none;
-                    outline: none;
-                }
-                QListWidget::item {
-                    padding: 8px 12px;
-                    text-align: center;
-                    color: gray;
-                    font-size: 14px;
-                }
-                QListWidget::item:selected {
-                    color: #0094FF;
-                    font-size: 16px;
-                    font-weight: bold;
-                }
-            """
-        self._list.setStyleSheet(list_ss)
-
-    def refresh_theme(self):
-        """主题切换时刷新样式"""
-        self._apply_list_style()
-
-    def set_lyrics(self, lyrics: List[Tuple[float, str]], translated: List[str] = None):
-        """设置歌词数据和可选的翻译数据"""
-        self._lyrics = lyrics
-        self._translated_lyrics = translated or []
-        self._refresh_list()
-
-    def set_translated_lyrics(self, translated: List[str]):
-        """设置翻译歌词数据并刷新显示"""
-        # 确保翻译列表与歌词列表长度一致
-        if len(translated) != len(self._lyrics):
-            # 长度不匹配时截断或补空
-            if len(translated) < len(self._lyrics):
-                translated = translated + [""] * (len(self._lyrics) - len(translated))
-            else:
-                translated = translated[:len(self._lyrics)]
-        self._translated_lyrics = translated
-        self._refresh_list()
-
-    def set_display_mode(self, mode: str):
-        """切换显示模式：original/translated/bilingual"""
-        self._display_mode = mode
-        self._refresh_list()
-
-    def get_display_mode(self) -> str:
-        return self._display_mode
-
-    def has_translation(self) -> bool:
-        """是否有翻译数据"""
-        return bool(self._translated_lyrics) and any(t.strip() for t in self._translated_lyrics)
-
-    def _refresh_list(self):
-        """根据当前模式和数据刷新列表显示"""
-        self._list.clear()
-        if not self._lyrics:
-            self._list.setVisible(False)
-            self._hint.setVisible(True)
-            self._current_line = -1
-            return
-
-        self._list.setVisible(True)
-        self._hint.setVisible(False)
-
-        for i, (_, text) in enumerate(self._lyrics):
-            display_text = self._build_line_text(i, text)
-            item = QListWidgetItem(display_text)
-            item.setTextAlignment(Qt.AlignCenter)
-            self._list.addItem(item)
-        self._current_line = -1
-
-    def _build_line_text(self, index: int, original: str) -> str:
-        """根据显示模式构建单行歌词文本"""
-        if self._display_mode == self.MODE_TRANSLATED and self.has_translation():
-            return self._translated_lyrics[index] if index < len(self._translated_lyrics) else original
-        elif self._display_mode == self.MODE_BILINGUAL and self.has_translation():
-            trans = self._translated_lyrics[index] if index < len(self._translated_lyrics) else ""
-            if trans and trans.strip():
-                return f"{original}\n{trans}"
-            return original
-        else:
-            return original
-
-    def update_position(self, position_sec: float):
-        if not self._lyrics:
-            return ""
-        lo, hi = 0, len(self._lyrics) - 1
-        found = -1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._lyrics[mid][0] <= position_sec:
-                found = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        if found != self._current_line and found >= 0:
-            self._current_line = found
-            self._list.setCurrentRow(found)
-            self._list.scrollToItem(self._list.item(found),
-                                    QListWidget.PositionAtCenter)
-        if found >= 0:
-            return self._lyrics[found][1]
-        return ""
-
-    def get_current_line_text(self, position_sec: float) -> str:
-        if not self._lyrics:
-            return ""
-        lo, hi = 0, len(self._lyrics) - 1
-        found = -1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._lyrics[mid][0] <= position_sec:
-                found = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        if found >= 0:
-            return self._lyrics[found][1]
-        return ""
-
-    def get_current_line_progress(self, position_sec: float) -> tuple:
-        """获取当前歌词行文本及演唱进度
-
-        Returns:
-            (text, progress): progress 范围 0.0~1.0，表示当前行已演唱比例
-        """
-        if not self._lyrics:
-            return "", 0.0
-        lo, hi = 0, len(self._lyrics) - 1
-        found = -1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._lyrics[mid][0] <= position_sec:
-                found = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        if found < 0:
-            return "", 0.0
-        line_start = self._lyrics[found][0]
-        # 下一行起始时间作为当前行结束参考
-        if found + 1 < len(self._lyrics):
-            line_end = self._lyrics[found + 1][0]
-        else:
-            line_end = line_start + 10.0  # 最后一行默认 10 秒
-        duration = max(0.1, line_end - line_start)
-        progress = max(0.0, min(1.0, (position_sec - line_start) / duration))
-        return self._lyrics[found][1], progress
-
-    def clear(self):
-        self._lyrics = []
-        self._translated_lyrics = []
-        self._list.clear()
-        self._list.setVisible(False)
-        self._hint.setVisible(True)
-        self._current_line = -1
-
-
-# ============================================================
-# 音频电平分析（用于桌面歌词声浪与音乐同步）
-# ============================================================
-class _AudioLevelWorker(QThread):
-    """后台使用 ffmpeg 解码音频文件，计算每 50ms 的 RMS 音量曲线。
-    计算结果通过 finished 信号返回 (audio_path, levels_list)。
-    若 ffmpeg 不可用或解码失败，返回空列表（调用方回退到伪随机波动）。"""
-    finished = Signal(str, list)  # (audio_path, rms_levels 0~1)
-
-    # 进度采样率与间隔
-    SAMPLE_RATE = 8000          # 低采样率已足够声浪可视化，减少数据量
-    INTERVAL_MS = 50            # 每 50ms 一个 RMS 采样点（与桌面歌词刷新率匹配）
-    MAX_LEVELS = 432000         # 理论上限：6 小时 × 3600s × 20 次/秒 = 432000，防内存爆炸
-    MAX_RUNTIME_SEC = 180       # 单文件分析最长 3 分钟，防 ffmpeg 挂死
-
-    def __init__(self, audio_path: str, ffmpeg_path: str = "ffmpeg", parent=None):
-        super().__init__(parent)
-        self._audio_path = audio_path
-        self._ffmpeg_path = ffmpeg_path
-
-    def run(self):
-        import time
-        start_ts = time.time()
-        try:
-            import subprocess
-            import struct
-            import math
-            import shutil
-
-            ffmpeg = self._ffmpeg_path or shutil.which("ffmpeg")
-            if not ffmpeg:
-                self.finished.emit(self._audio_path, [])
-                return
-            # 输入文件必须存在
-            if not os.path.exists(self._audio_path):
-                self.finished.emit(self._audio_path, [])
-                return
-
-            samples_per_interval = int(self.SAMPLE_RATE * self.INTERVAL_MS / 1000)
-            bytes_per_interval = samples_per_interval * 2  # 16-bit signed
-            if bytes_per_interval <= 0:
-                self.finished.emit(self._audio_path, [])
-                return
-
-            cmd = [
-                ffmpeg, "-i", self._audio_path,
-                "-f", "s16le",
-                "-acodec", "pcm_s16le",
-                "-ac", "1",                       # 单声道
-                "-ar", str(self.SAMPLE_RATE),
-                "-y",
-                "-",                              # 输出到 stdout
-            ]
-            # 关闭 stdin/stderr 避免继承主进程句柄导致异常环境下卡住
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            levels: list = []
-            read_chunk = bytes_per_interval
-            try:
-                while not self.isInterruptionRequested():
-                    # 总运行时长上限，防止 ffmpeg 异常挂死
-                    if time.time() - start_ts > self.MAX_RUNTIME_SEC:
-                        break
-                    data = proc.stdout.read(read_chunk)
-                    if not data or len(data) < read_chunk:
-                        break
-                    n = len(data) // 2
-                    if n <= 0:
-                        break
-                    samples = struct.unpack("<%dh" % n, data)
-                    sum_sq = 0
-                    for s in samples:
-                        sum_sq += s * s
-                    rms = math.sqrt(sum_sq / n)
-                    # 归一化到 0~1（16-bit signed 最大值 32767），并适度放大
-                    norm = min(1.0, rms / 32767.0)
-                    # 应用非线性放大让小音量也可见
-                    norm = math.pow(norm, 0.6)
-                    levels.append(norm)
-                    # 绝对数量上限，防异常文件（超长/损坏）导致内存爆炸
-                    if len(levels) >= self.MAX_LEVELS:
-                        break
-            finally:
-                try:
-                    if proc.stdout:
-                        proc.stdout.close()
-                except Exception:
-                    pass
-                try:
-                    if proc.poll() is None:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except Exception:
-                            try:
-                                proc.kill()
-                                proc.wait(timeout=1)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-            self.finished.emit(self._audio_path, levels)
-        except Exception as e:
-            logger.debug(f"音频电平分析失败 {self._audio_path}: {e}")
-            try:
-                self.finished.emit(self._audio_path, [])
-            except Exception:
-                pass
-
-
-# ============================================================
-# 歌词编辑器对话框
-# ============================================================
-class LyricsEditorDialog(QDialog):
-    """歌词编辑器：支持手动编辑、时间戳插入、播放时间调节、歌词延时调整。
-    直接继承 QDialog 避免与 qfluentwidgets Dialog 内部布局冲突导致内容空白。"""
-    def __init__(self, song_name: str, existing_text: str, lrc_path: str = None,
-                 source: str = None, parent=None):
-        super().__init__(parent)
-        self._song_name = song_name
-        self._lrc_path = lrc_path
-        self._save_path = lrc_path
-        self._source = source
-        self.setWindowTitle("歌词编辑器")
-        self.setFixedSize(720, 620)
-        self._build_ui(existing_text)
-
-    def _build_ui(self, existing_text: str):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(10)
-
-        # 标题
-        title = SubtitleLabel(f"🎵 歌词编辑 - {self._song_name}")
-        layout.addWidget(title)
-
-        # 来源（如果有）
-        if self._source:
-            source_hint = CaptionLabel(f"来源：{self._source}")
-            color = "#9AA4B2" if isDarkTheme() else "gray"
-            source_hint.setStyleSheet(f"color: {color}; padding: 0 0 2px 0;")
-            layout.addWidget(source_hint)
-
-        # 提示信息
-        hint = CaptionLabel(
-            "每行一句歌词，可使用 [mm:ss.xx] 格式添加时间戳。\n"
-            "「插入时间戳」在光标处插入当前播放时间；「-0.3s / +0.3s」批量调整所有时间戳。"
-        )
-        hint_color = "#AAAAAA" if isDarkTheme() else "gray"
-        hint.setStyleSheet(f"color: {hint_color}; padding: 4px 0;")
-        layout.addWidget(hint)
-
-        # ===== 播放时间控制行：显示当前时间 + 跳转/前进/后退 =====
-        time_row = QHBoxLayout()
-        time_row.setSpacing(6)
-        time_row.addWidget(BodyLabel("当前播放:"))
-
-        self._time_label = StrongBodyLabel("--:--.--")
-        self._time_label.setMinimumWidth(80)
-        self._time_label.setStyleSheet(
-            "font-family: Consolas, 'Courier New'; "
-            "color: #6C5CE7;"
-        )
-        time_row.addWidget(self._time_label)
-
-        # 后退 5 秒
-        self._back_btn = ToolButton(FIcon.SKIP_BACK, self)
-        self._back_btn.setToolTip("后退 5 秒")
-        self._back_btn.clicked.connect(lambda: self._seek_relative(-5000))
-        time_row.addWidget(self._back_btn)
-
-        # 前进 5 秒
-        self._fwd_btn = ToolButton(FIcon.SKIP_FORWARD, self)
-        self._fwd_btn.setToolTip("前进 5 秒")
-        self._fwd_btn.clicked.connect(lambda: self._seek_relative(5000))
-        time_row.addWidget(self._fwd_btn)
-
-        # 跳转到光标所在行的时间戳
-        self._jump_btn = PushButton(FIcon.SEND, "跳转到此行", self)
-        self._jump_btn.setToolTip("跳转到光标所在行的时间戳位置")
-        self._jump_btn.clicked.connect(self._jump_to_cursor_line)
-        time_row.addWidget(self._jump_btn)
-
-        time_row.addStretch()
-
-        # 播放/暂停切换
-        self._play_toggle_btn = ToolButton(FIcon.PLAY, self)
-        self._play_toggle_btn.setToolTip("播放/暂停")
-        self._play_toggle_btn.clicked.connect(self._toggle_play)
-        time_row.addWidget(self._play_toggle_btn)
-
-        layout.addLayout(time_row)
-
-        # 定时刷新当前播放时间标签
-        self._time_timer = QTimer(self)
-        self._time_timer.setInterval(200)
-        self._time_timer.timeout.connect(self._refresh_time_label)
-        self._time_timer.start()
-
-        # ===== 工具栏：时间戳操作 =====
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
-
-        self.insert_ts_btn = PushButton(FIcon.CALENDAR, "插入时间戳", self)
-        self.insert_ts_btn.setToolTip("在光标处插入当前播放时间 [mm:ss.xx]")
-        self.insert_ts_btn.clicked.connect(self._insert_timestamp)
-        toolbar.addWidget(self.insert_ts_btn)
-
-        # 歌词延时调节：-0.3s / +0.3s
-        self.delay_minus_btn = PushButton("-0.3s", self)
-        self.delay_minus_btn.setToolTip("所有时间戳整体减 0.3 秒（歌词提前）")
-        self.delay_minus_btn.clicked.connect(lambda: self._shift_all_timestamps(-300))
-        toolbar.addWidget(self.delay_minus_btn)
-
-        self.delay_plus_btn = PushButton("+0.3s", self)
-        self.delay_plus_btn.setToolTip("所有时间戳整体加 0.3 秒（歌词延后）")
-        self.delay_plus_btn.clicked.connect(lambda: self._shift_all_timestamps(300))
-        toolbar.addWidget(self.delay_plus_btn)
-
-        self.format_btn = PushButton(FIcon.FONT, "格式化", self)
-        self.format_btn.setToolTip("为每行添加递增时间戳（每 5 秒一行）")
-        self.format_btn.clicked.connect(self._format_lyrics)
-        toolbar.addWidget(self.format_btn)
-
-        self.clear_ts_btn = PushButton(FIcon.DELETE, "清除时间戳", self)
-        self.clear_ts_btn.setToolTip("移除所有时间戳标记")
-        self.clear_ts_btn.clicked.connect(self._clear_timestamps)
-        toolbar.addWidget(self.clear_ts_btn)
-
-        toolbar.addStretch()
-
-        self.save_as_btn = PushButton(FIcon.SAVE_AS, "另存为", self)
-        self.save_as_btn.clicked.connect(self._save_as)
-        toolbar.addWidget(self.save_as_btn)
-
-        layout.addLayout(toolbar)
-
-        # ===== 歌词编辑区 =====
-        self.text_edit = QTextEdit(self)
-        self.text_edit.setPlainText(existing_text)
-        # 根据主题设置编辑区背景，确保深/浅色都可读
-        if isDarkTheme():
-            self.text_edit.setStyleSheet("""
-                QTextEdit {
-                    background: #2B2D30;
-                    color: #D8D8D8;
-                    border: 1px solid #3C3F44;
-                    border-radius: 8px;
-                    font-family: 'Microsoft YaHei UI', 'Consolas';
-                    font-size: 14px;
-                    padding: 8px;
-                }
-            """)
-        else:
-            self.text_edit.setStyleSheet("""
-                QTextEdit {
-                    background: #FFFFFF;
-                    color: #1F1F1F;
-                    border: 1px solid #E0E0E0;
-                    border-radius: 8px;
-                    font-family: 'Microsoft YaHei UI', 'Consolas';
-                    font-size: 14px;
-                    padding: 8px;
-                }
-            """)
-        layout.addWidget(self.text_edit, 1)
-
-        # ===== 底部按钮 =====
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        self.cancel_btn = PushButton("取消", self)
-        self.cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(self.cancel_btn)
-
-        self.save_btn = PrimaryPushButton(FIcon.SAVE, "保存", self)
-        self.save_btn.clicked.connect(self.accept)
-        btn_row.addWidget(self.save_btn)
-
-        layout.addLayout(btn_row)
-
-    # ------------------------------------------------------------------
-    # 播放时间控制
-    # ------------------------------------------------------------------
-    def _get_player(self):
-        """获取外层播放器（安全访问）"""
-        outer = self.parent()
-        if outer and hasattr(outer, '_player'):
-            return outer._player
-        return None
-
-    def _refresh_time_label(self):
-        """定时刷新当前播放时间显示"""
-        player = self._get_player()
-        if not player:
-            return
-        try:
-            pos_ms = player.position()
-            m = pos_ms // 60000
-            s = (pos_ms % 60000) // 1000
-            cs = (pos_ms % 1000) // 10
-            self._time_label.setText(f"{m:02d}:{s:02d}.{cs:02d}")
-            # 同步更新播放/暂停按钮图标
-            state = player.playbackState()
-            if state == QMediaPlayer.PlaybackState.PlayingState:
-                self._play_toggle_btn.setIcon(FIcon.PAUSE)
-            else:
-                self._play_toggle_btn.setIcon(FIcon.PLAY)
-        except Exception:
-            pass
-
-    def _seek_relative(self, delta_ms: int):
-        """相对跳转：前进/后退 delta_ms 毫秒"""
-        player = self._get_player()
-        if not player:
-            return
-        try:
-            new_pos = max(0, player.position() + delta_ms)
-            duration = player.duration()
-            if duration > 0:
-                new_pos = min(new_pos, duration)
-            player.setPosition(new_pos)
-        except Exception:
-            pass
-
-    def _toggle_play(self):
-        """切换播放/暂停"""
-        player = self._get_player()
-        if not player:
-            return
-        try:
-            state = player.playbackState()
-            if state == QMediaPlayer.PlaybackState.PlayingState:
-                player.pause()
-            else:
-                outer = self.parent()
-                if outer and hasattr(outer, '_do_play'):
-                    outer._do_play()
-                else:
-                    player.play()
-        except Exception:
-            pass
-
-    def _jump_to_cursor_line(self):
-        """跳转到光标所在行的时间戳对应的时间"""
-        cursor = self.text_edit.textCursor()
-        block = cursor.block()
-        line_text = block.text()
-        # 匹配行首时间戳 [mm:ss.xx] 或 [mm:ss]
-        match = re.match(r'\[(\d+):(\d+)(?:\.(\d+))?\]', line_text)
-        if not match:
-            InfoBar.warning("无时间戳", "该行没有时间戳，无法跳转", duration=2000, parent=self)
-            return
-        try:
-            m = int(match.group(1))
-            s = int(match.group(2))
-            ms_str = match.group(3) or "0"
-            # 补齐到 2 位（[mm:ss.x] → ms=x*10）
-            ms = int(ms_str.ljust(2, '0')[:2])
-            pos_ms = m * 60000 + s * 1000 + ms * 10
-            player = self._get_player()
-            if player:
-                player.setPosition(pos_ms)
-                InfoBar.success("已跳转", f"到 {m:02d}:{s:02d}.{ms:02d}",
-                                duration=1500, parent=self)
-        except Exception as e:
-            logger.debug(f"跳转失败: {e}")
-
-    # ------------------------------------------------------------------
-    # 时间戳操作
-    # ------------------------------------------------------------------
-    def _insert_timestamp(self):
-        """在光标位置插入当前播放时间"""
-        player = self._get_player()
-        if not player:
-            InfoBar.warning("无法插入", "播放器未激活", duration=2000, parent=self)
-            return
-        try:
-            pos_ms = player.position()
-            total_s = pos_ms // 1000
-            ms = (pos_ms % 1000) // 10
-            m = total_s // 60
-            s = total_s % 60
-            ts = f"[{m:02d}:{s:02d}.{ms:02d}]"
-            cursor = self.text_edit.textCursor()
-            cursor.insertText(ts)
-            self.text_edit.setTextCursor(cursor)
-        except Exception as e:
-            logger.debug(f"插入时间戳失败: {e}")
-
-    def _shift_all_timestamps(self, delta_ms: int):
-        """批量调整所有时间戳：delta_ms > 0 延后，< 0 提前。
-        支持格式：[mm:ss.xx]（百分秒）、[mm:ss.xxx]（毫秒）、[mm:ss]"""
-        text = self.text_edit.toPlainText()
-
-        def shift_match(match):
-            try:
-                m = int(match.group(1))
-                s = int(match.group(2))
-                ms_str = match.group(3)
-                if ms_str:
-                    # 根据小数位数换算成毫秒：.5=500ms, .50=500ms, .500=500ms
-                    ms = int(int(ms_str) / (10 ** len(ms_str)) * 1000)
-                else:
-                    ms = 0
-                # 计算原始时间（毫秒）+ 偏移
-                total_ms = m * 60000 + s * 1000 + ms + delta_ms
-                if total_ms < 0:
-                    total_ms = 0
-                new_m = total_ms // 60000
-                new_s = (total_ms % 60000) // 1000
-                new_ms = (total_ms % 1000) // 10  # 输出用百分秒（2位）
-                return f"[{new_m:02d}:{new_s:02d}.{new_ms:02d}]"
-            except Exception:
-                return match.group(0)
-
-        # 匹配 [mm:ss.xx]、[mm:ss.xxx] 或 [mm:ss]，支持 1~3 位小数
-        new_text = re.sub(r'\[(\d+):(\d+)(?:\.(\d{1,3}))?\]', shift_match, text)
-        self.text_edit.setPlainText(new_text)
-        direction = "延后" if delta_ms > 0 else "提前"
-        amount = abs(delta_ms) / 1000.0
-        try:
-            InfoBar.success("延时调整", f"所有时间戳{direction} {amount:.1f} 秒",
-                            duration=2000, parent=self)
-        except Exception:
-            # InfoBar 在 QDialog 中可能异常，回退到窗口标题提示
-            self.setWindowTitle(f"歌词编辑器 - 已{direction} {amount:.1f} 秒")
-
-    def _format_lyrics(self):
-        """为无时间戳的行自动添加递增时间戳"""
-        text = self.text_edit.toPlainText()
-        lines = text.split('\n')
-        formatted = []
-        current_time = 0.0
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # 移除已有时间戳
-            clean = re.sub(r'\[\d+:\d+(?:\.\d+)?\]', '', line).strip()
-            if clean:
-                m = int(current_time // 60)
-                s = int(current_time % 60)
-                ms = int((current_time % 1) * 100)
-                formatted.append(f"[{m:02d}:{s:02d}.{ms:02d}]{clean}")
-                current_time += 5.0  # 每行默认间隔 5 秒
-        self.text_edit.setPlainText('\n'.join(formatted))
-        InfoBar.success("格式化完成", f"共 {len(formatted)} 行", duration=2000, parent=self)
-
-    def _clear_timestamps(self):
-        """清除所有时间戳标记"""
-        text = self.text_edit.toPlainText()
-        cleaned = re.sub(r'\[\d+:\d+(?:\.\d+)?\]', '', text)
-        # 清理多余空格
-        lines = [line.strip() for line in cleaned.split('\n')]
-        self.text_edit.setPlainText('\n'.join(lines))
-
-    def _save_as(self):
-        """选择另存为路径"""
-        default_name = f"{self._song_name}.lrc"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存歌词文件", default_name, "LRC 歌词 (*.lrc);;文本文件 (*.txt)"
-        )
-        if path:
-            self._save_path = path
-
-    def get_lyrics_text(self) -> str:
-        return self.text_edit.toPlainText()
-
-    def get_save_path(self) -> str:
-        return self._save_path or ""
-
-    def closeEvent(self, event):
-        """关闭时停止时间刷新定时器"""
-        try:
-            if hasattr(self, '_time_timer') and self._time_timer:
-                self._time_timer.stop()
-        except Exception:
-            pass
-        super().closeEvent(event)
-
-
-# ============================================================
-# 均衡器对话框
-# ============================================================
-class EqualizerDialog(QDialog):
-    """均衡器对话框：10 频段增益调节 + 预设管理。
-    由于 QMediaPlayer/QAudioOutput 不支持原生 EQ 滤波，
-    本对话框作为 UI 控制面板：增益值会通过 gain_changed 信号
-    传递给外层，外层可据此做整体音量补偿（按最大增益提升音量）
-    并持久化用户的 EQ 偏好。"""
-    gain_changed = Signal(list)
-
-    def __init__(self, parent=None, initial_gains: List[int] = None):
-        super().__init__(parent)
-        self.setWindowTitle("均衡器 EQ")
-        self.setFixedSize(560, 360)
-        self._sliders: List[Slider] = []
-        self._build_ui(initial_gains or [0] * 10)
-
-    def _build_ui(self, initial_gains: List[int]):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
-
-        # 标题
-        title = SubtitleLabel("🎛️ 均衡器 EQ")
-        layout.addWidget(title)
-
-        hint = CaptionLabel(
-            "拖动滑块调节各频段增益（-12 ~ +12 dB）。\n"
-            "由于 Qt 多媒体后端限制，EQ 主要作为偏好预设保存；"
-            "整体音量会按最大增益做补偿。"
-        )
-        hint_color = "#AAAAAA" if isDarkTheme() else "gray"
-        hint.setStyleSheet(f"color: {hint_color}; padding: 2px 0;")
-        layout.addWidget(hint)
-
-        # 预设栏
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(BodyLabel("预设:"))
-        self._preset_combo = ComboBox(self)
-        self._preset_combo.addItems(list(EQ_PRESETS.keys()))
-        self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
-        preset_row.addWidget(self._preset_combo)
-        preset_row.addStretch()
-
-        # 重置按钮
-        reset_btn = PushButton("重置", self)
-        reset_btn.setToolTip("所有频段归零")
-        reset_btn.clicked.connect(self._reset_gains)
-        preset_row.addWidget(reset_btn)
-        layout.addLayout(preset_row)
-
-        # 频段滑块网格
-        bands_widget = QWidget(self)
-        bands_layout = QGridLayout(bands_widget)
-        bands_layout.setSpacing(6)
-        for i, band_name in enumerate(EQ_BANDS):
-            label = CaptionLabel(band_name)
-            label.setAlignment(Qt.AlignCenter)
-            bands_layout.addWidget(label, 0, i)
-
-            slider = Slider(Qt.Vertical, self)
-            slider.setRange(-12, 12)
-            # 应用初始增益
-            try:
-                init_val = initial_gains[i] if i < len(initial_gains) else 0
-            except Exception:
-                init_val = 0
-            slider.setValue(init_val)
-            slider.setFixedHeight(100)
-            slider.valueChanged.connect(lambda v, idx=i: self._on_slider_changed(idx, v))
-            bands_layout.addWidget(slider, 1, i)
-            self._sliders.append(slider)
-
-            val_label = StrongBodyLabel(f"{init_val:+d}")
-            val_label.setAlignment(Qt.AlignCenter)
-            val_label.setFixedWidth(44)
-            slider._val_label = val_label
-            bands_layout.addWidget(val_label, 2, i)
-
-        layout.addWidget(bands_widget, 1)
-
-        # 底部说明
-        info = CaptionLabel(
-            "提示：选择预设可快速套用经典曲线；"
-            "调节后会自动通过信号通知外层应用。"
-        )
-        info.setStyleSheet(f"color: {hint_color}; padding: 4px 0;")
-        layout.addWidget(info)
-
-    def _on_preset_changed(self, index: int):
-        preset_name = self._preset_combo.currentText()
-        gains = EQ_PRESETS.get(preset_name, [0] * 10)
-        for i, gain in enumerate(gains):
-            if i < len(self._sliders):
-                self._sliders[i].setValue(gain)
-        # emit 一次最终的增益列表
-        self.gain_changed.emit(self.get_gains())
-
-    def _on_slider_changed(self, idx: int, value: int):
-        if 0 <= idx < len(self._sliders):
-            lbl = getattr(self._sliders[idx], '_val_label', None)
-            if lbl:
-                lbl.setText(f"{value:+d}")
-        self.gain_changed.emit(self.get_gains())
-
-    def _reset_gains(self):
-        for s in self._sliders:
-            s.setValue(0)
-        self.gain_changed.emit(self.get_gains())
-
-    def get_gains(self) -> List[int]:
-        return [s.value() for s in self._sliders]
 
 
 # ============================================================
@@ -1524,7 +222,9 @@ class AudioPlayerPage(QWidget):
             info_layout = QVBoxLayout()
             info_layout.setSpacing(2)
             self.title_label = StrongBodyLabel("未播放")
-            self.title_label.setStyleSheet("font-size: 14px;")
+            font = self.title_label.font()
+            font.setPixelSize(14)
+            self.title_label.setFont(font)
             self.title_label.setWordWrap(False)
             info_layout.addWidget(self.title_label)
             self.artist_label = CaptionLabel("")
@@ -1613,483 +313,7 @@ class AudioPlayerPage(QWidget):
         def mouseReleaseEvent(self, event):
             self._drag_pos = None
 
-    # ================================================================
-    # 桌面悬浮歌词（嵌套类）
-    # ================================================================
-    class DesktopLyrics(QWidget):
-        """桌面悬浮歌词窗口（声浪动效 + 卡拉OK渐变填充 + 玻璃质感）"""
-        close_requested = Signal()
-
-        def __init__(self, outer_instance):
-            super().__init__(None)
-            self._outer = outer_instance
-            self._drag_pos: Optional[QPoint] = None
-            self._current_text: str = ""
-            self._current_progress: float = 0.0    # 当前行演唱进度 0~1
-            self._font_size: int = 22
-            self._opacity: int = 85
-            self._anim_offset: float = 0.0        # 渐变流动偏移
-            self._fade_alpha: float = 1.0          # 歌词切换淡入透明度
-            self._show_black_bg: bool = False       # 是否保留黑底
-            self._wave_phase: float = 0.0          # 声浪动画相位
-            self._current_level: float = -1.0      # 当前音频 RMS（-1 表示无数据）
-            self._is_playing: bool = False         # 当前是否在播放
-            self._setup_ui()
-            self._update_timer = QTimer(self)
-            self._update_timer.setInterval(50)     # 20fps，驱动动画
-            self._update_timer.timeout.connect(self._on_tick)
-            self._update_timer.start()
-
-        def _setup_ui(self):
-            self.setWindowFlags(
-                Qt.FramelessWindowHint
-                | Qt.WindowStaysOnTopHint
-                | Qt.Tool
-            )
-            self.setAttribute(Qt.WA_TranslucentBackground, True)
-            self.setFixedSize(760, 84)
-            self.setContextMenuPolicy(Qt.CustomContextMenu)
-            self.customContextMenuRequested.connect(self._show_context_menu)
-
-        def _on_tick(self):
-            """每帧更新：声浪 + 流动渐变 + 淡入 + 卡拉OK进度。
-            外层 AudioPlayerPage 已销毁或属性缺失时，安全回退到静止状态，避免闪退。"""
-            import math
-            # 渐变颜色流动
-            self._anim_offset = (self._anim_offset + 0.008) % 1.0
-            # 声浪相位推进（用于无音频数据时的回退波动 & 颜色变化）
-            self._wave_phase = (self._wave_phase + 0.12) % (2 * math.pi)
-            # 淡入效果
-            if self._fade_alpha < 1.0:
-                self._fade_alpha = min(1.0, self._fade_alpha + 0.06)
-
-            # 外层引用与关键属性检查（最外层防崩：任何环节失败都安全回退）
-            outer_ok = (
-                self._outer is not None
-                and hasattr(self._outer, "_player")
-                and hasattr(self._outer, "_get_current_audio_level")
-                and hasattr(self._outer, "lyrics_widget")
-            )
-
-            if outer_ok:
-                # 获取当前播放状态与音频电平
-                try:
-                    state = self._outer._player.playbackState()
-                    self._is_playing = (state == QMediaPlayer.PlaybackState.PlayingState)
-                    # 从外层获取当前时刻的 RMS 音量（0~1，-1 表示无数据）
-                    self._current_level = self._outer._get_current_audio_level()
-                except Exception:
-                    self._is_playing = False
-                    self._current_level = -1.0
-
-                # 刷新歌词文本和演唱进度
-                try:
-                    if hasattr(self._outer._player, "position"):
-                        pos_ms = self._outer._player.position()
-                    else:
-                        pos_ms = 0
-                    # 应用歌词偏移（正值延后，负值提前）
-                    offset = getattr(self._outer, '_lyrics_offset_ms', 0)
-                    lw = self._outer.lyrics_widget
-                    if hasattr(lw, "get_current_line_progress"):
-                        text, progress = lw.get_current_line_progress((pos_ms + offset) / 1000.0)
-                    else:
-                        text, progress = "", 0.0
-                    if self._current_text != text:
-                        self._current_text = text
-                        self._fade_alpha = 0.0  # 新歌词触发淡入
-                    self._current_progress = progress
-                except Exception:
-                    pass
-            else:
-                # 外层不可达：静止显示当前歌词，不再更新任何动态数据
-                self._is_playing = False
-                self._current_level = -1.0
-
-            # 绘制刷新（即使外层挂了也允许绘制最后状态，避免白屏）
-            try:
-                self.update()
-            except Exception:
-                pass
-
-        def closeEvent(self, event):
-            """关闭时停止定时器，避免关闭后仍有定时器回调访问已销毁对象。"""
-            try:
-                if hasattr(self, "_update_timer") and self._update_timer:
-                    try:
-                        self._update_timer.stop()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                self.close_requested.emit()
-            except Exception:
-                pass
-            try:
-                super().closeEvent(event)
-            except Exception:
-                event.accept()
-
-        def set_font_size(self, size: int):
-            self._font_size = max(12, min(48, size))
-            self.update()
-
-        def set_opacity(self, opacity: int):
-            self._opacity = max(30, min(100, opacity))
-            self.update()
-
-        def set_black_bg(self, show: bool):
-            self._show_black_bg = show
-            self.update()
-
-        def _show_context_menu(self, point: QPoint):
-            menu = QMenu(self)
-            action_close = menu.addAction("关闭桌面歌词")
-            action_close.triggered.connect(self.close_requested.emit)
-
-            menu.addSeparator()
-
-            # 黑底开关
-            action_bg = menu.addAction("保留黑底")
-            action_bg.setCheckable(True)
-            action_bg.setChecked(self._show_black_bg)
-            action_bg.triggered.connect(lambda: self.set_black_bg(not self._show_black_bg))
-
-            font_menu = menu.addMenu("字体大小")
-            for size in [14, 16, 18, 20, 22, 24, 28, 32, 36]:
-                a = font_menu.addAction(f"{size}px")
-                a.setCheckable(True)
-                a.setChecked(size == self._font_size)
-                a.triggered.connect(lambda _=False, s=size: self.set_font_size(s))
-
-            opacity_menu = menu.addMenu("透明度")
-            for op in [40, 55, 70, 85, 100]:
-                a = opacity_menu.addAction(f"{op}%")
-                a.setCheckable(True)
-                a.setChecked(op == self._opacity)
-                a.triggered.connect(lambda _=False, o=op: self.set_opacity(o))
-
-            menu.exec(self.mapToGlobal(point))
-
-        def _draw_glass_bg(self, painter, base_alpha):
-            """绘制玻璃质感背景"""
-            bg_rect = self.rect().adjusted(2, 2, -2, -2)
-
-            if self._show_black_bg:
-                # 黑底：半透明深色 + 微妙渐变
-                bg_grad = QLinearGradient(0, 0, 0, self.height())
-                bg_grad.setColorAt(0.0, QColor(20, 20, 30, int(base_alpha * 0.75)))
-                bg_grad.setColorAt(0.5, QColor(10, 10, 18, int(base_alpha * 0.65)))
-                bg_grad.setColorAt(1.0, QColor(8, 8, 14, int(base_alpha * 0.72)))
-            else:
-                # 无黑底：浅色玻璃质感
-                bg_grad = QLinearGradient(0, 0, 0, self.height())
-                bg_grad.setColorAt(0.0, QColor(255, 255, 255, int(base_alpha * 0.18)))
-                bg_grad.setColorAt(0.5, QColor(200, 210, 230, int(base_alpha * 0.10)))
-                bg_grad.setColorAt(1.0, QColor(180, 190, 210, int(base_alpha * 0.14)))
-
-            painter.setBrush(QBrush(bg_grad))
-            painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(bg_rect, 16, 16)
-
-            # 玻璃顶部高光带（模拟光线折射）
-            highlight_grad = QLinearGradient(0, 2, 0, self.height() // 2)
-            highlight_grad.setColorAt(0.0, QColor(255, 255, 255, int(base_alpha * 0.22)))
-            highlight_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-            painter.setBrush(QBrush(highlight_grad))
-            painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(bg_rect.adjusted(1, 1, -1, -bg_rect.height() // 2 + 2), 15, 15)
-
-            # 玻璃边框
-            border_alpha = int(base_alpha * 0.10)
-            painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(255, 255, 255, border_alpha), 1))
-            painter.drawRoundedRect(bg_rect, 16, 16)
-
-        def _draw_waveform(self, painter, base_alpha):
-            """绘制两侧声波动效。
-            优先使用真实音频 RMS 电平驱动幅度，无数据时回退到伪随机波动。
-            暂停时声浪归零，呈现静止状态。"""
-            import math
-            bar_count = 12
-            bar_width = 3
-            bar_gap = 4
-            bar_area_width = bar_count * (bar_width + bar_gap)
-            center_y = self.height() // 2
-            max_bar_height = self.height() - 20
-
-            # 当前真实音频电平（0~1），-1 表示无数据
-            real_level = self._current_level if self._is_playing else -1.0
-            # 无音频数据时的回退幅度：仅当播放中才动起来
-            has_real_data = real_level >= 0.0
-
-            for side in ('left', 'right'):
-                if side == 'left':
-                    start_x = 16
-                else:
-                    start_x = self.width() - 16 - bar_area_width
-
-                for i in range(bar_count):
-                    if not self._is_playing:
-                        # 暂停/停止：声浪几乎归零，仅保留极小幅度
-                        amplitude = 0.05
-                    elif has_real_data:
-                        # 真实音频驱动：以 RMS 为基础，叠加频谱样式的小波动
-                        # 越靠中间的 bar 幅度越大，模拟频谱低频在中间的形态
-                        # i 范围 0..11，中心位置约 5.5
-                        center_dist = abs(i - (bar_count - 1) / 2) / ((bar_count - 1) / 2)
-                        # 中心权重：中心 1.0，两端 0.55
-                        center_weight = 1.0 - center_dist * 0.45
-                        # 叠加细节波动（基于相位的正弦，幅度小）
-                        phase = self._wave_phase + i * 0.4 + (0 if side == 'left' else math.pi / 3)
-                        detail = (math.sin(phase) * 0.5 + 0.5) * 0.35 + 0.65
-                        amplitude = min(1.0, real_level * center_weight * detail + 0.05)
-                    else:
-                        # 回退：无音频数据时使用多正弦波叠加伪随机波动
-                        phase = self._wave_phase + i * 0.4 + (0 if side == 'left' else math.pi / 3)
-                        wave1 = math.sin(phase) * 0.5 + 0.5
-                        wave2 = math.sin(phase * 2.3) * 0.3 + 0.3
-                        wave3 = math.sin(phase * 0.7 + 1.0) * 0.2 + 0.2
-                        amplitude = min(1.0, wave1 * 0.5 + wave2 * 0.3 + wave3 * 0.2)
-
-                    bar_height = int(max_bar_height * amplitude)
-                    if bar_height < 3:
-                        bar_height = 3
-
-                    x = start_x + i * (bar_width + bar_gap)
-                    y = center_y - bar_height // 2
-
-                    # 渐变色：颜色随相位变化
-                    hue_t = self._wave_phase + i * 0.2
-                    r = int(255 * (0.5 + 0.5 * math.sin(hue_t)))
-                    g = int(180 * (0.5 + 0.5 * math.sin(hue_t + 2.0)))
-                    b = int(255 * (0.5 + 0.5 * math.sin(hue_t + 4.0)))
-                    grad = QLinearGradient(0, y, 0, y + bar_height)
-                    grad.setColorAt(0.0, QColor(r, g, b, int(base_alpha * 0.9)))
-                    grad.setColorAt(1.0, QColor(r, g, b, int(base_alpha * 0.3)))
-
-                    painter.setBrush(QBrush(grad))
-                    painter.setPen(Qt.NoPen)
-                    painter.drawRoundedRect(QRect(x, y, bar_width, bar_height), 2, 2)
-
-
-        def paintEvent(self, event):
-            import math
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-
-            base_alpha = int(255 * self._opacity / 100)
-            alpha = int(base_alpha * self._fade_alpha)
-
-            # === 玻璃质感背景 ===
-            self._draw_glass_bg(painter, base_alpha)
-
-            # === 声浪动效 ===
-            self._draw_waveform(painter, base_alpha)
-
-            # === 歌词文本（卡拉OK渐变填充） ===
-            text = self._current_text if self._current_text else "♪ 暂无歌词 ♪"
-            font = QFont("Microsoft YaHei UI", self._font_size, QFont.Bold)
-            painter.setFont(font)
-            # 文本区域：左右留出声浪空间
-            text_rect = QRect(90, 0, self.width() - 180, self.height())
-
-            if text == "♪ 暂无歌词 ♪":
-                painter.setPen(QPen(QColor(180, 180, 180, base_alpha)))
-                painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignHCenter, text)
-            else:
-                # 1. 描边阴影增强可读性
-                if self._show_black_bg:
-                    shadow_color = QColor(255, 255, 255, int(alpha* 0.5))
-                else:
-                    shadow_color = QColor(255, 255, 255, int(alpha * 0.5))
-                painter.setPen(QPen(shadow_color))
-                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]:
-                    painter.drawText(text_rect.adjusted(dx, dy, dx, dy),
-                                     Qt.AlignVCenter | Qt.AlignHCenter, text)
-
-                # 2. 未演唱部分（暗色底文）
-                dim_color = QColor(255, 255, 255, int(alpha*0.5)) if self._show_black_bg else QColor(255, 255, 255, int(alpha))
-                painter.setPen(QPen(dim_color))
-                painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignHCenter, text)
-
-                # 3. 已演唱部分（亮色渐变，按进度裁剪）
-                fm = painter.fontMetrics()
-                text_width = fm.horizontalAdvance(text)
-                sung_width = int(text_width * self._current_progress)
-
-                if sung_width > 0:
-                    painter.save()
-                    # 裁剪到已演唱区域
-                    clip_x = text_rect.x() + (text_rect.width() - text_width) // 2
-                    clip_rect = QRect(clip_x, text_rect.y(), sung_width, text_rect.height())
-                    painter.setClipRect(clip_rect)
-                    
-                    # 流动渐变：颜色偏移随时间变化
-                    offset = self._anim_offset
-                    grad = QLinearGradient(clip_x - self.width() * offset, 0,
-                                           clip_x + text_width, 0)
-                    t = offset * 2 * math.pi
-
-                    #方案1
-                    """r1 = int(105 * (0.5 + 0.5 * math.sin(t))+150)
-                    g1 = int(105 * (0.5 + 0.5 * math.sin(t + 1.0))+150)
-                    b1 = int(105 * (0.5 + 0.5 * math.sin(t + 2.0))+150)
-                    r2 = int(105 * (0.5 + 0.5 * math.sin(t + 3.14))+150)
-                    g2 = int(105 * (0.5 + 0.5 * math.sin(t + 4.14))+150)
-                    b2 = int(105 * (0.5 + 0.5 * math.sin(t + 5.14))+150)"""
-
-                    #方案2
-                    # Color1: 红色系（蓝色通道固定为低值）
-                    r1 = int(105 * (0.5 + 0.5 * math.sin(t)) + 150)      # 150~255
-                    g1 = int(50 * (0.5 + 0.5 * math.sin(t + 1.0)))       # 0~50
-                    b1 = 5                                                # 固定低值
-
-                    # Color2: 蓝色系（红色通道固定为低值）
-                    r2 = 5                                                # 固定低值
-                    g2 = int(50 * (0.5 + 0.5 * math.sin(t + 4.14)))       # 0~50
-                    b2 = int(105 * (0.5 + 0.5 * math.sin(t + 3.14)) + 150) # 150~255
-                    grad.setColorAt(0.0, QColor(r1, g1, b1, alpha))
-                    grad.setColorAt(0.5, QColor(r2, g2, b2, alpha))
-                    grad.setColorAt(1.0, QColor(r1, g1, b1, alpha))
-
-                    painter.setPen(QPen(QBrush(grad), 1))
-                    painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignHCenter, text)
-                    painter.restore()
-
-        def mousePressEvent(self, event):
-            if event.button() == Qt.LeftButton:
-                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-                event.accept()
-
-        def mouseMoveEvent(self, event):
-            if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
-                self.move(event.globalPosition().toPoint() - self._drag_pos)
-                event.accept()
-
-        def mouseReleaseEvent(self, event):
-            self._drag_pos = None
-
-    # ================================================================
-    # 统计对话框（嵌套类）
-    # ================================================================
-    class StatsDialog(Dialog):
-        """播放历史统计对话框"""
-        def __init__(self, outer_instance, parent=None):
-            super().__init__(parent=parent if parent else outer_instance)
-            self._outer = outer_instance
-            self.setWindowTitle("播放统计")
-            self.setFixedSize(560, 520)
-            self._build_ui()
-            self._compute_and_show()
-
-        def _build_ui(self):
-            layout = QVBoxLayout(self)
-            layout.setContentsMargins(24, 24, 24, 24)
-            layout.setSpacing(16)
-
-            title = SubtitleLabel("播放历史统计")
-            layout.addWidget(title)
-
-            self.content_edit = QTextEdit()
-            self.content_edit.setReadOnly(True)
-            # 根据主题设置编辑区背景，确保深/浅色都可读
-            if isDarkTheme():
-                self.content_edit.setStyleSheet("""
-                    QTextEdit {
-                        background: #2B2D30;
-                        color: #D8D8D8;
-                        border: none;
-                        font-family: 'Microsoft YaHei UI';
-                        font-size: 13px;
-                    }
-                """)
-            else:
-                self.content_edit.setStyleSheet("""
-                    QTextEdit {
-                        background: transparent;
-                        color: inherit;
-                        border: none;
-                        font-family: 'Microsoft YaHei UI';
-                        font-size: 13px;
-                    }
-                """)
-            layout.addWidget(self.content_edit, 1)
-
-            btn_row = QHBoxLayout()
-            btn_row.addStretch()
-            close_btn = PushButton(FIcon.ACCEPT, "关闭", self)
-            close_btn.clicked.connect(self.accept)
-            btn_row.addWidget(close_btn)
-            layout.addLayout(btn_row)
-
-        def _compute_and_show(self):
-            if not self._outer._db:
-                self.content_edit.setHtml("<p style='color:gray'>数据库不可用</p>")
-                return
-
-            html_parts = []
-            try:
-                history = self._outer._db.get_play_history(limit=10000)
-            except Exception:
-                history = []
-
-            total_count = len(history)
-            html_parts.append(f"<h3 style='margin:4px 0;'>📊 总览</h3>")
-            html_parts.append(f"<p style='margin:4px 0 12px 0;'>累计播放次数：<b>{total_count}</b> 次</p>")
-
-            song_counter = Counter()
-            artist_counter = Counter()
-            for h in history:
-                title = h.get('title') or os.path.basename(h.get('file_path', ''))
-                song_counter[title] += 1
-                artist = (h.get('artist') or '未知艺术家').strip()
-                if artist:
-                    artist_counter[artist] += 1
-
-            html_parts.append("<h3 style='margin:4px 0;'>🎵 TOP 5 歌曲</h3>")
-            top_songs = song_counter.most_common(5)
-            if top_songs:
-                for i, (name, cnt) in enumerate(top_songs, 1):
-                    html_parts.append(
-                        f"<p style='margin:2px 0;'>&nbsp;&nbsp;{i}. <b>{name}</b> — {cnt} 次</p>"
-                    )
-            else:
-                html_parts.append("<p style='color:gray;margin:2px 0;'>暂无数据</p>")
-
-            html_parts.append("<h3 style='margin:12px 0 4px 0;'>🎤 TOP 5 艺术家</h3>")
-            top_artists = artist_counter.most_common(5)
-            if top_artists:
-                for i, (name, cnt) in enumerate(top_artists, 1):
-                    html_parts.append(
-                        f"<p style='margin:2px 0;'>&nbsp;&nbsp;{i}. <b>{name}</b> — {cnt} 次</p>"
-                    )
-            else:
-                html_parts.append("<p style='color:gray;margin:2px 0;'>暂无数据</p>")
-
-            html_parts.append("<h3 style='margin:12px 0 4px 0;'>📅 最近 7 天播放数</h3>")
-            today = datetime.now().date()
-            for i in range(6, -1, -1):
-                day = today - timedelta(days=i)
-                day_str = day.strftime("%Y-%m-%d")
-                day_cnt = 0
-                for h in history:
-                    try:
-                        ts = h.get('timestamp') or h.get('created_at') or ''
-                        if ts and day_str in str(ts):
-                            day_cnt += 1
-                    except Exception:
-                        pass
-                weekday = ["一", "二", "三", "四", "五", "六", "日"][day.weekday()]
-                bar_len = min(20, day_cnt)
-                bar = "█" * bar_len if day_cnt > 0 else "░"
-                html_parts.append(
-                    f"<p style='margin:2px 0;font-family:Consolas;'>"
-                    f"{day_str}(周{weekday}) | {bar} {day_cnt} 次</p>"
-                )
-
-            self.content_edit.setHtml("\n".join(html_parts))
+    
 
     # ================================================================
     # 主构造
@@ -2124,6 +348,11 @@ class AudioPlayerPage(QWidget):
         self._progress_timer.setInterval(200)
         self._progress_timer.timeout.connect(self._on_progress_tick)
 
+        # 断点续播：定期保存播放位置到数据库（5秒一次，避免频繁写库）
+        self._save_position_timer = QTimer(self)
+        self._save_position_timer.setInterval(5000)
+        self._save_position_timer.timeout.connect(self._save_current_position)
+
         try:
             from ..database import get_database
             self._db = get_database()
@@ -2132,13 +361,14 @@ class AudioPlayerPage(QWidget):
             self._db = None
 
         self._mini_player: Optional[AudioPlayerPage.MiniPlayer] = None
-        self._desktop_lyrics: Optional[AudioPlayerPage.DesktopLyrics] = None
+        self._desktop_lyrics: Optional[DesktopLyrics] = None
 
         self._global_hotkeys = None
         self._pynput_available = False
         # Win32 全局热键线程控制
         self._hotkey_thread = None
         self._hotkey_stop_flag = None
+        self._hotkey_connected = False
 
         # 音频电平缓存：{audio_path: [rms_levels]}，供桌面歌词声浪使用
         self._audio_level_cache: Dict[str, list] = {}
@@ -2171,10 +401,6 @@ class AudioPlayerPage(QWidget):
         title_row = QHBoxLayout()
         title_row.addWidget(SubtitleLabel("音频播放器"))
         title_row.addStretch()
-
-        self.stats_btn = ToolButton(FIcon.DOCUMENT, self)
-        self.stats_btn.setToolTip("播放统计")
-        title_row.addWidget(self.stats_btn)
 
         self.mini_btn = ToolButton(FIcon.HOME, self)
         self.mini_btn.setToolTip("迷你模式")
@@ -2230,7 +456,9 @@ class AudioPlayerPage(QWidget):
         track_info_layout = QVBoxLayout()
         track_info_layout.setSpacing(4)
         self.track_title_label = StrongBodyLabel("未播放")
-        self.track_title_label.setStyleSheet("font-size: 16px;")
+        font = self.track_title_label.font()
+        font.setPixelSize(16)
+        self.track_title_label.setFont(font)
         track_info_layout.addWidget(self.track_title_label)
         self.track_artist_label = CaptionLabel("")
         track_info_layout.addWidget(self.track_artist_label)
@@ -2364,6 +592,18 @@ class AudioPlayerPage(QWidget):
         self.translate_lrc_btn.setToolTip("翻译歌词（联网）")
         lyrics_header.addWidget(self.translate_lrc_btn)
 
+        # 人工纠正翻译按钮
+        self.correct_lrc_btn = ToolButton(FIcon.EDIT, lyrics_card)
+        self.correct_lrc_btn.setToolTip("人工纠正翻译结果")
+        self.correct_lrc_btn.setEnabled(False)
+        lyrics_header.addWidget(self.correct_lrc_btn)
+
+        # 删除翻译按钮
+        self.delete_trans_btn = ToolButton(FIcon.DELETE, lyrics_card)
+        self.delete_trans_btn.setToolTip("删除中文翻译")
+        self.delete_trans_btn.setEnabled(False)
+        lyrics_header.addWidget(self.delete_trans_btn)
+
         # 字幕模式切换：原文 / 双语 / 翻译
         self.lyrics_mode_combo = ComboBox(lyrics_card)
         self.lyrics_mode_combo.addItems(["原文", "双语", "翻译"])
@@ -2407,10 +647,6 @@ class AudioPlayerPage(QWidget):
         self.search_combo.setFixedWidth(120)
         header_layout.addWidget(self.search_combo)
 
-        self.history_stats_btn = PushButton(FIcon.HISTORY, "统计", self)
-        self.history_stats_btn.setToolTip("查看播放历史统计")
-        header_layout.addWidget(self.history_stats_btn)
-
         header_layout.addStretch()
 
         self.batch_btn = PushButton(FIcon.MENU, "批量操作", self)
@@ -2427,6 +663,10 @@ class AudioPlayerPage(QWidget):
         self.rescan_btn = PushButton(FIcon.SYNC, "重新扫描", self)
         self.rescan_btn.setToolTip("重新扫描下载目录")
         header_layout.addWidget(self.rescan_btn)
+
+        self.clean_btn = PushButton(FIcon.DELETE, "🗑 清理空文件", self)
+        self.clean_btn.setToolTip("删除大小为 0 的空音频文件和空目录")
+        header_layout.addWidget(self.clean_btn)
 
         pl_layout.addLayout(header_layout)
 
@@ -2460,7 +700,7 @@ class AudioPlayerPage(QWidget):
         self.sleep_label = CaptionLabel("")
         self.sleep_label.setAlignment(Qt.AlignCenter)
         # 睡眠定时器颜色：深色模式用亮黄橙色保证可读性，浅色模式用标准橙色
-        sleep_color = "#FFCC66" if isDarkTheme() else "orange"
+        sleep_color = "#FFCC66" if isDarkTheme() else "orange"  # COLOR-11: 睡眠定时器文字颜色（深色#FFCC66 / 浅色orange）
         self.sleep_label.setStyleSheet(f"color: {sleep_color};")
         self.sleep_label.setVisible(False)
         main_layout.addWidget(self.sleep_label)
@@ -3033,6 +1273,7 @@ class AudioPlayerPage(QWidget):
         self.next_btn.clicked.connect(self._play_next)
         # 手动点击重新扫描 → 下次 _scan_audio_files 执行完自动分类后弹整理结果
         self.rescan_btn.clicked.connect(self._on_rescan_and_notify)
+        self.clean_btn.clicked.connect(self._clean_empty_files)
         self.play_mode_btn.clicked.connect(self._cycle_play_mode)
         self.fav_btn.clicked.connect(self._toggle_favorite)
         self.load_lrc_btn.clicked.connect(self._manual_load_lrc)
@@ -3042,6 +1283,8 @@ class AudioPlayerPage(QWidget):
         self.lyrics_delay_minus_btn.clicked.connect(lambda: self._adjust_lyrics_offset(-300))
         self.lyrics_delay_plus_btn.clicked.connect(lambda: self._adjust_lyrics_offset(300))
         self.translate_lrc_btn.clicked.connect(self._translate_lyrics)
+        self.correct_lrc_btn.clicked.connect(self._correct_translation)
+        self.delete_trans_btn.clicked.connect(self._delete_translation)
         self.lyrics_mode_combo.currentIndexChanged.connect(self._on_lyrics_mode_changed)
         self.sleep_btn.clicked.connect(self._show_sleep_menu)
         self.import_btn.clicked.connect(self._import_playlist)
@@ -3069,8 +1312,6 @@ class AudioPlayerPage(QWidget):
 
         self.mini_btn.clicked.connect(self._toggle_mini_player)
         self.desktop_lyrics_switch.checkedChanged.connect(self._toggle_desktop_lyrics)
-        self.stats_btn.clicked.connect(self._show_stats_dialog)
-        self.history_stats_btn.clicked.connect(self._show_stats_dialog)
 
     # ------------------------------------------------------------------
     # 快捷键（本地 + 全局）
@@ -3079,19 +1320,17 @@ class AudioPlayerPage(QWidget):
         QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._toggle_play)
         QShortcut(QKeySequence(Qt.Key_Left), self, activated=self._play_prev)
         QShortcut(QKeySequence(Qt.Key_Right), self, activated=self._play_next)
-        QShortcut(QKeySequence("Ctrl+Up"), self,
+        # 音量控制（与视频播放器保持一致）
+        QShortcut(QKeySequence(Qt.Key_Up), self,
                   activated=lambda: self.volume_slider.setValue(min(100, self.volume_slider.value() + 5)))
-        QShortcut(QKeySequence("Ctrl+Down"), self,
+        QShortcut(QKeySequence(Qt.Key_Down), self,
                   activated=lambda: self.volume_slider.setValue(max(0, self.volume_slider.value() - 5)))
+        QShortcut(QKeySequence(Qt.Key_M), self, activated=self._toggle_mute)
+        # 快进/快退 10 秒（与视频播放器保持一致）
+        QShortcut(QKeySequence("Ctrl+Left"), self, activated=self._seek_backward)
+        QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._seek_forward)
 
-        QShortcut(QKeySequence("Ctrl+Alt+Space"), self, activated=self._toggle_play)
-        QShortcut(QKeySequence("Ctrl+Alt+Left"), self, activated=self._play_prev)
-        QShortcut(QKeySequence("Ctrl+Alt+Right"), self, activated=self._play_next)
-        QShortcut(QKeySequence("Ctrl+Alt+Up"), self,
-                  activated=lambda: self.volume_slider.setValue(min(100, self.volume_slider.value() + 5)))
-        QShortcut(QKeySequence("Ctrl+Alt+Down"), self,
-                  activated=lambda: self.volume_slider.setValue(max(0, self.volume_slider.value() - 5)))
-
+        # 全局快捷键通过 _setup_global_hotkeys 使用 Win32 API 注册，后台也生效
         self._setup_global_hotkeys()
 
     def _setup_global_hotkeys(self):
@@ -3108,11 +1347,10 @@ class AudioPlayerPage(QWidget):
         from ctypes import wintypes
 
         # 连接信号到槽（Qt 自动使用 QueuedConnection 跨线程传递到主线程）
-        try:
+        if self._hotkey_connected:
             self.hotkey_triggered.disconnect()
-        except Exception:
-            pass
         self.hotkey_triggered.connect(self._on_hotkey_triggered, Qt.QueuedConnection)
+        self._hotkey_connected = True
 
         # 从配置读取快捷键
         try:
@@ -3316,7 +1554,7 @@ class AudioPlayerPage(QWidget):
     def _toggle_desktop_lyrics(self, checked: bool):
         if checked:
             if self._desktop_lyrics is None:
-                self._desktop_lyrics = AudioPlayerPage.DesktopLyrics(self)
+                self._desktop_lyrics = DesktopLyrics(self)
                 self._desktop_lyrics.close_requested.connect(
                     lambda: self.desktop_lyrics_switch.setChecked(False)
                 )
@@ -3335,13 +1573,6 @@ class AudioPlayerPage(QWidget):
                 except Exception:
                     pass
                 self._desktop_lyrics = None
-
-    # ------------------------------------------------------------------
-    # 统计对话框
-    # ------------------------------------------------------------------
-    def _show_stats_dialog(self):
-        dlg = AudioPlayerPage.StatsDialog(self, self)
-        dlg.exec()
 
     # ------------------------------------------------------------------
     # 扫描音频文件
@@ -3445,6 +1676,49 @@ class AudioPlayerPage(QWidget):
             logger.warning(f"获取下载路径失败: {e}")
             return ""
 
+    def _clean_empty_files(self):
+        """清理空音频文件和空目录"""
+        from qfluentwidgets import InfoBar
+        download_path = self._get_download_path()
+        if not download_path or not os.path.isdir(download_path):
+            InfoBar.info("没有文件", "音乐目录不存在", duration=2000, parent=self)
+            return
+
+        deleted_files = 0
+        deleted_dirs = 0
+
+        # 遍历所有子目录，删除空音频文件（0 字节）
+        for root, dirs, files in os.walk(download_path, topdown=False):
+            for name in files:
+                if name.lower().endswith(AUDIO_EXTENSIONS):
+                    path = os.path.join(root, name)
+                    try:
+                        if os.path.getsize(path) == 0:
+                            os.remove(path)
+                            deleted_files += 1
+                            logger.info(f"删除空音频文件: {path}")
+                    except Exception as e:
+                        logger.debug(f"删除文件失败 {path}: {e}")
+            # 删除空目录
+            try:
+                if root != download_path and not os.listdir(root):
+                    os.rmdir(root)
+                    deleted_dirs += 1
+                    logger.info(f"删除空目录: {root}")
+            except Exception:
+                pass
+
+        if deleted_files > 0 or deleted_dirs > 0:
+            InfoBar.success(
+                "清理完成",
+                f"删除 {deleted_files} 个空文件，{deleted_dirs} 个空目录",
+                duration=3000, parent=self
+            )
+            # 清理后重新扫描
+            self._scan_audio_files()
+        else:
+            InfoBar.info("无需清理", "未发现空文件或空目录", duration=2000, parent=self)
+
     def _scan_audio_files(self):
         # 停止播放器，避免清空播放列表时播放器访问无效索引导致崩溃
         try:
@@ -3466,14 +1740,10 @@ class AudioPlayerPage(QWidget):
             self._update_empty_hint()
             return
 
+        # 使用 scandir_recursive 加速扫描（比 os.walk 快 2~3 倍）
         found: List[str] = []
         try:
-            for root, _dirs, files in os.walk(download_path):
-                for name in files:
-                    if name.lower().endswith(AUDIO_EXTENSIONS):
-                        full_path = os.path.join(root, name)
-                        if os.path.isfile(full_path):
-                            found.append(full_path)
+            found = scandir_recursive(download_path, AUDIO_EXTENSIONS)
         except Exception as e:
             logger.error(f"扫描音频文件失败: {e}", exc_info=True)
 
@@ -3602,6 +1872,9 @@ class AudioPlayerPage(QWidget):
     def _play_index(self, index: int, resume: bool = True):
         if not self._playlist or not (0 <= index < len(self._playlist)):
             return
+
+        # 切换歌曲时中止正在进行的翻译
+        self._translate_aborted = True
 
         if self._current_index >= 0 and self._db:
             try:
@@ -3928,18 +2201,24 @@ class AudioPlayerPage(QWidget):
             # 尝试加载缓存的翻译
             translated = self._load_cached_translation(lrc_path)
             self.lyrics_widget.set_lyrics(self._lyrics_data, translated)
-            if translated:
-                # 有缓存的翻译，启用模式切换
+            has_trans = bool(translated) and any(t.strip() for t in translated)
+            if has_trans:
                 self.lyrics_mode_combo.setEnabled(True)
+                self.correct_lrc_btn.setEnabled(True)
+                self.delete_trans_btn.setEnabled(True)
             else:
                 self.lyrics_mode_combo.setEnabled(True)
+                self.correct_lrc_btn.setEnabled(False)
+                self.delete_trans_btn.setEnabled(False)
         else:
             self._lyrics_data = []
             self.lyrics_widget.clear()
             self.lyrics_mode_combo.setEnabled(False)
+            self.correct_lrc_btn.setEnabled(False)
+            self.delete_trans_btn.setEnabled(False)
 
     def _load_cached_translation(self, lrc_path: str) -> list:
-        """加载缓存的翻译文件（.lrc.zh.lrc）"""
+        """加载缓存的翻译文件（.lrc.zh.lrc），同时将文件头中的来源标记写回 InfoBar"""
         trans_path = lrc_path.replace('.lrc', '.zh.lrc').replace('.LRC', '.zh.lrc')
         if os.path.isfile(trans_path):
             try:
@@ -3947,23 +2226,36 @@ class AudioPlayerPage(QWidget):
                     lines = f.readlines()
                 # 解析翻译行（保留时间戳格式但只取文本）
                 result = []
+                source = ""
                 for line in lines:
                     line = line.strip()
                     if not line:
                         result.append("")
                         continue
+                    # 检查文件头中的翻译来源标记
+                    if line.startswith("# 翻译来源:"):
+                        source = line.split(":", 1)[1].strip()
+                        continue
                     text = re.sub(r'\[\d+:\d+(?:\.\d+)?\]', '', line).strip()
                     result.append(text)
+                # 如果有来源标记，在 InfoBar 中显示
+                if source:
+                    from qfluentwidgets import InfoBar
+                    InfoBar.info("翻译已加载", f"来源: {source}", duration=2000,
+                                 parent=self.parent() if self.parent() else None)
                 return result
             except Exception:
                 pass
         return []
 
-    def _save_translation(self, lrc_path: str, translated_lines: list):
-        """保存翻译到 .zh.lrc 文件"""
+    def _save_translation(self, lrc_path: str, translated_lines: list, source_name: str = ""):
+        """保存翻译到 .zh.lrc 文件（source_name 会写入文件头）"""
         trans_path = lrc_path.replace('.lrc', '.zh.lrc').replace('.LRC', '.zh.lrc')
         try:
             with open(trans_path, 'w', encoding='utf-8') as f:
+                # 写入翻译来源标记（文件头注释）
+                if source_name:
+                    f.write(f"# 翻译来源: {source_name}\n")
                 for i, (time_sec, _) in enumerate(self._lyrics_data):
                     trans = translated_lines[i] if i < len(translated_lines) else ""
                     m = int(time_sec // 60)
@@ -3979,6 +2271,9 @@ class AudioPlayerPage(QWidget):
             InfoBar.warning("无歌词", "请先加载歌词后再翻译", duration=3000, parent=self)
             return
 
+        # 设置 abort 标志，旧的翻译线程会自动忽略
+        self._translate_aborted = True
+
         # 检查是否已有翻译缓存
         audio_path = self._playlist[self._current_index]
         lrc_path = _find_lrc_for_audio(audio_path)
@@ -3988,11 +2283,27 @@ class AudioPlayerPage(QWidget):
             self.lyrics_mode_combo.setCurrentIndex(1)  # 切换到双语
             return
 
+        # 检查 DeepSeek API Key 是否已配置
+        from ..config import get_config
+        api_key = get_config().get(get_config().deepseek_api_key)
+        if not api_key:
+            InfoBar.warning(
+                "未配置 AI 翻译",
+                "DeepSeek API Key 未设置，将使用百度翻译（质量一般）。\n"
+                "可在设置页面配置 DeepSeek API Key 以获得更好的翻译效果。",
+                duration=5000, parent=self
+            )
+
         InfoBar.info("正在翻译", "正在联网翻译歌词，请稍候...", duration=3000, parent=self)
         self.translate_lrc_btn.setEnabled(False)
 
         # 提取原文行
         original_lines = [text for _, text in self._lyrics_data]
+
+        # 记录当前歌曲路径，用于翻译完成后校验
+        self._translate_audio_path = audio_path
+        self._translate_lrc_path = lrc_path
+        self._translate_aborted = False
 
         # 启动翻译线程
         self._translate_worker = _TranslateWorker(original_lines, parent=self)
@@ -4000,22 +2311,30 @@ class AudioPlayerPage(QWidget):
         self._translate_worker.error.connect(self._on_translate_error)
         self._translate_worker.start()
 
-    def _on_translate_finished(self, _source_path: str, translated_lines: list):
+    def _on_translate_finished(self, _source_path: str, translated_lines: list, source_name: str = ""):
         """翻译完成回调"""
         self.translate_lrc_btn.setEnabled(True)
+
+        # 检查是否已被用户切换歌曲时取消（aborted）
+        if getattr(self, '_translate_aborted', False):
+            logger.debug("翻译已完成但用户已切换歌曲，忽略结果")
+            return
+
         self.lyrics_widget.set_translated_lyrics(translated_lines)
 
-        # 保存翻译缓存
-        if self._current_index >= 0:
-            audio_path = self._playlist[self._current_index]
-            lrc_path = _find_lrc_for_audio(audio_path)
-            if lrc_path:
-                self._save_translation(lrc_path, translated_lines)
+        # 保存翻译缓存（校验歌曲路径是否一致）
+        lrc_path = getattr(self, '_translate_lrc_path', None)
+        if lrc_path and os.path.isfile(lrc_path):
+            self._save_translation(lrc_path, translated_lines, source_name)
 
-        InfoBar.success("翻译完成", "可点击下拉框切换 原文/双语/翻译 模式",
+        source_tag = f"（来源: {source_name}）" if source_name else ""
+        InfoBar.success("翻译完成", f"可点击下拉框切换显示模式{source_tag}",
                         duration=3000, parent=self)
         # 自动切换到双语模式
         self.lyrics_mode_combo.setCurrentIndex(1)
+        # 启用人工纠正和删除翻译按钮
+        self.correct_lrc_btn.setEnabled(True)
+        self.delete_trans_btn.setEnabled(True)
 
     def _on_translate_error(self, _source_path: str, error_msg: str):
         """翻译失败回调"""
@@ -4027,6 +2346,104 @@ class AudioPlayerPage(QWidget):
         mode_map = {0: LyricsWidget.MODE_ORIGINAL, 1: LyricsWidget.MODE_BILINGUAL, 2: LyricsWidget.MODE_TRANSLATED}
         mode = mode_map.get(index, LyricsWidget.MODE_ORIGINAL)
         self.lyrics_widget.set_display_mode(mode)
+
+    def _correct_translation(self):
+        """人工纠正翻译对话框"""
+        if not self._lyrics_data:
+            InfoBar.warning("无歌词", "请先加载歌词", duration=2000, parent=self)
+            return
+        if not self.lyrics_widget.has_translation():
+            InfoBar.warning("无翻译", "请先进行翻译", duration=2000, parent=self)
+            return
+
+        # 获取当前翻译
+        translated_lines = self.lyrics_widget._translated_lyrics.copy() if hasattr(self.lyrics_widget, '_translated_lyrics') else []
+        # 格式：原文行 | 翻译行，便于用户对照修改
+        content_lines = []
+        for i, (_, original) in enumerate(self._lyrics_data):
+            trans = translated_lines[i] if i < len(translated_lines) else ""
+            content_lines.append(f"{original}\t{trans}")
+        content = "\n".join(content_lines)
+
+        # 打开编辑对话框
+        dialog = LyricsEditorDialog(
+            self.track_title_label.text() or "歌词",
+            content,
+            None,
+            self
+        )
+        if dialog.exec():
+            # 解析修改后的内容
+            corrected = []
+            for line in dialog.get_text().splitlines():
+                line = line.strip()
+                if not line:
+                    corrected.append("")
+                    continue
+                # 按 tab 分割，取翻译部分（第二列）
+                parts = line.split("\t", 1)
+                if len(parts) >= 2:
+                    corrected.append(parts[1].strip())
+                else:
+                    corrected.append(parts[0].strip())
+
+            # 确保行数一致
+            while len(corrected) < len(self._lyrics_data):
+                corrected.append("")
+            corrected = corrected[:len(self._lyrics_data)]
+
+            # 更新歌词组件
+            self.lyrics_widget.set_translated_lyrics(corrected)
+
+            # 保存到文件
+            if self._current_index >= 0:
+                audio_path = self._playlist[self._current_index]
+                lrc_path = _find_lrc_for_audio(audio_path)
+                if lrc_path:
+                    self._save_translation(lrc_path, corrected)
+
+            InfoBar.success("修改已保存", "翻译结果已更新并保存", duration=2000, parent=self)
+
+    def _delete_translation(self):
+        """删除当前歌曲的中文翻译文件（.zh.lrc）"""
+        if self._current_index < 0:
+            return
+
+        audio_path = self._playlist[self._current_index]
+        lrc_path = _find_lrc_for_audio(audio_path)
+        if not lrc_path:
+            InfoBar.warning("无翻译", "当前歌曲没有歌词文件", duration=2000, parent=self)
+            return
+
+        trans_path = lrc_path.replace('.lrc', '.zh.lrc').replace('.LRC', '.zh.lrc')
+        if not os.path.isfile(trans_path):
+            InfoBar.warning("无翻译", "当前歌曲没有中文翻译", duration=2000, parent=self)
+            return
+
+        # 确认删除
+        from qfluentwidgets import MessageBox
+        msg = MessageBox(
+            "确认删除翻译",
+            f"确定要删除「{os.path.basename(audio_path)}」的中文翻译吗？\n此操作不可恢复。",
+            self
+        )
+        if not msg.exec():
+            return
+
+        try:
+            os.remove(trans_path)
+            logger.info(f"已删除翻译文件: {trans_path}")
+        except Exception as e:
+            InfoBar.error("删除失败", str(e), duration=3000, parent=self)
+            return
+
+        # 清除歌词组件中的翻译数据
+        self.lyrics_widget.set_translated_lyrics([])
+        self.lyrics_mode_combo.setCurrentIndex(0)  # 切回原文模式
+        self.correct_lrc_btn.setEnabled(False)
+        self.delete_trans_btn.setEnabled(False)
+
+        InfoBar.success("翻译已删除", "中文翻译文件已移除", duration=2000, parent=self)
 
     def _manual_load_lrc(self):
         if self._current_index < 0:
@@ -4046,7 +2463,7 @@ class AudioPlayerPage(QWidget):
                                 duration=3000, parent=self)
 
     def _edit_lyrics(self):
-        """打开歌词编辑器对话框"""
+        """打开歌词编辑器对话框（支持同时编辑原文和翻译）"""
         if self._current_index < 0:
             InfoBar.warning("未播放", "请先选择一首歌曲", duration=2000, parent=self)
             return
@@ -4063,6 +2480,18 @@ class AudioPlayerPage(QWidget):
                     existing_text = f.read()
             except Exception:
                 pass
+        # 读取翻译歌词（.zh.lrc），追加到编辑器末尾
+        if lrc_path:
+            trans_path = lrc_path.replace('.lrc', '.zh.lrc').replace('.LRC', '.zh.lrc')
+            if os.path.isfile(trans_path):
+                try:
+                    with open(trans_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                        trans_text = f.read().strip()
+                    if trans_text:
+                        existing_text += "\n\n# ===== 翻译歌词（可编辑） =====\n"
+                        existing_text += trans_text
+                except Exception:
+                    pass
 
         dialog = LyricsEditorDialog(
             audio_name, existing_text,
@@ -4076,9 +2505,29 @@ class AudioPlayerPage(QWidget):
             save_path = dialog.get_save_path() or os.path.join(
                 os.path.dirname(audio_path), f"{audio_name}.lrc"
             )
+
+            # 分离原文和翻译
+            final_lrc = lyrics_text
+            trans_part = ""
+            sep = "# ===== 翻译歌词"
+            if sep in lyrics_text:
+                parts = lyrics_text.split(sep, 1)
+                final_lrc = parts[0].strip()
+                trans_part = parts[1].strip()
+                # 去掉第一行（分隔符剩余部分，如 "（可编辑） =====\n"）
+                first_newline = trans_part.find("\n")
+                if first_newline >= 0:
+                    trans_part = trans_part[first_newline:].strip()
+
             try:
+                # 保存原文
                 with open(save_path, 'w', encoding='utf-8') as f:
-                    f.write(lyrics_text)
+                    f.write(final_lrc)
+                # 保存翻译
+                if trans_part:
+                    trans_save_path = save_path.replace('.lrc', '.zh.lrc').replace('.LRC', '.zh.lrc')
+                    with open(trans_save_path, 'w', encoding='utf-8') as f:
+                        f.write(trans_part)
                 # 重新加载歌词
                 self._lyrics_data = _parse_lrc(save_path)
                 translated = self._load_cached_translation(save_path)
@@ -4116,7 +2565,6 @@ class AudioPlayerPage(QWidget):
 
         InfoBar.info("搜索中", f"正在搜索「{search_key}」的歌词...",
                      duration=3000, parent=self)
-        QApplication.processEvents()
 
         # 在后台线程搜索
         from PySide6.QtCore import QThread, Signal as QSignal
@@ -4403,6 +2851,23 @@ class AudioPlayerPage(QWidget):
         except Exception as e:
             logger.debug(f"刷新进度失败: {e}")
 
+    def _save_current_position(self):
+        """保存当前播放位置到数据库（用于断点续播）"""
+        try:
+            if 0 <= self._current_index < len(self._playlist):
+                path = self._playlist[self._current_index]
+                position = self._player.position()
+                duration = self._player.duration()
+                # 已播放到结尾则清除记录，避免下次从头续播
+                if duration > 0 and position >= duration - 2000:
+                    from ..database import get_database
+                    get_database().clear_position(path)
+                elif position > 1000:
+                    from ..database import get_database
+                    get_database().save_position(path, int(position))
+        except Exception as e:
+            logger.debug(f"保存播放位置失败: {e}")
+
     def _on_slider_pressed(self):
         self._is_seeking = True
 
@@ -4441,6 +2906,18 @@ class AudioPlayerPage(QWidget):
             restore = self._last_volume if self._last_volume > 0 else 70
             self.volume_slider.setValue(restore)
 
+    def _seek_forward(self):
+        """快进 10 秒"""
+        cur = self._player.position()
+        dur = self._player.duration()
+        if dur > 0:
+            self._player.setPosition(min(dur, cur + 10000))
+
+    def _seek_backward(self):
+        """快退 10 秒"""
+        cur = self._player.position()
+        self._player.setPosition(max(0, cur - 10000))
+
     # ------------------------------------------------------------------
     # 播放状态与自动下一首
     # ------------------------------------------------------------------
@@ -4450,12 +2927,15 @@ class AudioPlayerPage(QWidget):
             self.play_btn.setIcon(FIcon.PAUSE)
             self.play_btn.setToolTip("暂停")
             self._progress_timer.start()
+            self._save_position_timer.start()  # 开始定时保存播放位置
             self.cover_label.set_playing(True)
             self.play_state_changed.emit(True)
         else:
             self.play_btn.setIcon(FIcon.PLAY)
             self.play_btn.setToolTip("播放")
             self._progress_timer.stop()
+            self._save_position_timer.stop()  # 停止定时保存
+            self._save_current_position()     # 立即保存一次
             self.cover_label.set_playing(False)
             self.play_state_changed.emit(False)
         if self._mini_player:
@@ -4951,6 +3431,20 @@ class AudioPlayerPage(QWidget):
             new_artist = artist_edit.text().strip()
             new_album = album_edit.text().strip()
 
+            # ========== 如果正在播放该文件，先暂停并记录位置 ==========
+            was_playing = False
+            resume_position = 0
+            is_current_file = False
+            if self._current_index >= 0 and self._current_index < len(self._playlist):
+                cur_path = os.path.normcase(os.path.abspath(self._playlist[self._current_index]))
+                edit_path = os.path.normcase(os.path.abspath(path))
+                if cur_path == edit_path:
+                    is_current_file = True
+                    state = self._player.playbackState()
+                    was_playing = (state == QMediaPlayer.PlayingState)
+                    resume_position = self._player.position()
+                    self._player.stop()
+
             # ========== 写入标签 ==========
             changed = False
 
@@ -5062,6 +3556,18 @@ class AudioPlayerPage(QWidget):
             except Exception:
                 pass
 
+            # ========== 恢复播放（如果修改前正在播放该文件且未被移动） ==========
+            if is_current_file and not moved and was_playing:
+                # _move_file_and_sync 内部已处理移动时的恢复，此处处理未移动时的情况
+                # 注意：_move_file_and_sync 中已注册了 QTimer.singleShot 恢复，这里需要避免重复
+                if self._player.playbackState() == QMediaPlayer.StoppedState:
+                    try:
+                        self._player.setSource(QUrl.fromLocalFile(new_path))
+                        self._player.setPosition(resume_position)
+                        self._do_play()
+                    except Exception:
+                        pass
+
         except ImportError:
             InfoBar.warning("缺少依赖", "需要安装 mutagen 库", duration=3000, parent=self)
         except Exception as e:
@@ -5154,8 +3660,12 @@ class AudioPlayerPage(QWidget):
             return
 
         InfoBar.info("正在检测", "正在计算文件指纹...", duration=2000, parent=self)
-        QApplication.processEvents()
 
+        # 使用 QTimer.singleShot 延迟执行，让 InfoBar 先显示
+        QTimer.singleShot(100, self._do_detect_duplicates)
+
+    def _do_detect_duplicates(self):
+        """执行重复文件检测（延迟执行，不阻塞 UI）"""
         groups: Dict[str, List[str]] = {}
         for path in self._playlist:
             try:
@@ -5173,23 +3683,51 @@ class AudioPlayerPage(QWidget):
         total_dup = sum(len(v) - 1 for v in duplicates.values())
         msg = f"检测到 {len(duplicates)} 组重复，共 {total_dup} 个冗余文件。\n"
         for md5, paths in list(duplicates.items())[:5]:
-            msg += f"\n• {os.path.basename(paths[0])} ({len(paths)}份)"
+            msg += f"\n  {os.path.basename(paths[0])} ({len(paths)}份)"
         if len(duplicates) > 5:
             msg += f"\n...还有 {len(duplicates) - 5} 组"
 
         ret = QMessageBox.question(
-            self, "重复文件检测", msg + "\n\n是否查看详情并清理？",
+            self, "重复文件检测", msg + "\n\n是否删除冗余文件（每组保留一个）？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
-        if ret == QMessageBox.Yes:
-            self.playlist_list.clearSelection()
-            for i in range(self.playlist_list.count()):
-                item = self.playlist_list.item(i)
-                path = item.data(Qt.UserRole)
-                for paths in duplicates.values():
-                    if path in paths:
-                        item.setSelected(True)
-                        break
+        if ret != QMessageBox.Yes:
+            return
+
+        # 删除冗余文件：每组保留第一个，删除其余
+        deleted_count = 0
+        failed_paths = []
+        for paths in duplicates.values():
+            keep = paths[0]
+            for dup_path in paths[1:]:
+                try:
+                    # 如果正在播放被删除的文件，先停止
+                    if self._current_index >= 0 and self._current_index < len(self._playlist):
+                        cur = os.path.normcase(os.path.abspath(self._playlist[self._current_index]))
+                        dup = os.path.normcase(os.path.abspath(dup_path))
+                        if cur == dup:
+                            self._player.stop()
+                            self._current_index = -1
+                    os.remove(dup_path)
+                    if self._db:
+                        self._db.remove_favorite(dup_path)
+                        self._db.clear_position(dup_path)
+                    deleted_count += 1
+                except Exception as e:
+                    failed_paths.append(os.path.basename(dup_path))
+                    logger.warning(f"删除重复文件失败 {dup_path}: {e}")
+
+        # 重新扫描
+        self._scan_audio_files()
+
+        if failed_paths:
+            InfoBar.warning("部分删除失败",
+                           f"已删除 {deleted_count} 个冗余文件，{len(failed_paths)} 个失败",
+                           duration=3000, parent=self)
+        else:
+            InfoBar.success("清理完成",
+                           f"已删除 {deleted_count} 个冗余文件",
+                           duration=2000, parent=self)
 
     # ------------------------------------------------------------------
     # 播放列表导入/导出
@@ -5342,7 +3880,7 @@ class AudioPlayerPage(QWidget):
     def _apply_progress_slider_style(self):
         """根据当前主题应用进度条样式"""
         if isDarkTheme():
-            slider_ss = """
+            slider_ss = """  # BG-11: 进度条背景色（深色方案）
                 QSlider::groove:horizontal {
                     height: 6px;
                     background: #3C3C3C;
@@ -5367,7 +3905,7 @@ class AudioPlayerPage(QWidget):
                 }
             """
         else:
-            slider_ss = """
+            slider_ss = """  # BG-12: 进度条背景色（浅色方案）
                 QSlider::groove:horizontal {
                     height: 6px;
                     background: #E0E0E0;
@@ -5394,7 +3932,8 @@ class AudioPlayerPage(QWidget):
         self.progress_slider.setStyleSheet(slider_ss)
 
     def _on_theme_changed(self):
-        """主题切换时刷新颜色"""
+        """主题切换时刷新样式"""
+        # 标签颜色由 monkey-patch 自动处理，无需手动更新
         # 刷新进度条样式
         try:
             self._apply_progress_slider_style()
@@ -5432,9 +3971,9 @@ class AudioPlayerPage(QWidget):
     def _apply_list_text_color(self):
         """根据当前主题设置所有列表的文字颜色"""
         if isDarkTheme():
-            list_ss = "QListWidget { color: #FFFFFF; } QListWidget::item:selected { color: #4DB8FF; }"
+            list_ss = "QListWidget { color: #FFFFFF; } QListWidget::item:selected { color: #4DB8FF; }"  # COLOR-12: 列表文字颜色（深色#FFFFFF / 选中#4DB8FF）
         else:
-            list_ss = "QListWidget { color: #000000; } QListWidget::item:selected { color: #0094FF; }"
+            list_ss = "QListWidget { color: #000000; } QListWidget::item:selected { color: #0094FF; }"  # COLOR-13: 列表文字颜色（浅色#000000 / 选中#0094FF）
         for attr in ('playlist_list', 'folder_list', 'folder_song_list',
                      'artist_list', 'artist_song_list', 'album_list', 'album_song_list'):
             if hasattr(self, attr):

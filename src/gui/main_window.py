@@ -37,8 +37,8 @@ from ..models import VideoInfo, DownloadTask, DownloadStatus, MediaType, VideoQu
 from ..bilibili_api import BilibiliClient
 from ..downloader import BilibiliDownloader, create_downloader, _quality_name
 from ..cookie_manager import CookieManager, get_best_cookies, fetch_cookies_from_browser
-from .audio_player_page import AudioPlayerPage
-from .video_player_page import VideoPlayerPage
+from .audio_player_page import AudioPlayerPage, AUDIO_EXTENSIONS
+from .video_player_page import VideoPlayerPage, VIDEO_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -249,18 +249,22 @@ class MainWindow(FluentWindow):
         self._dl_refresh_timer.timeout.connect(self._on_dl_refresh_tick)
 
     def switchTo(self, widget):
-        """切换页面并播放淡入动画"""
+        """切换页面"""
         super().switchTo(widget)
-        # 淡入动画
-        if self._page_anim:
-            self._page_anim.stop()
-        widget.setWindowOpacity(0.0)
-        self._page_anim = QPropertyAnimation(widget, b"windowOpacity", self)
-        self._page_anim.setDuration(200)
-        self._page_anim.setStartValue(0.0)
-        self._page_anim.setEndValue(1.0)
-        self._page_anim.setEasingCurve(QEasingCurve.OutCubic)
-        self._page_anim.start()
+        # 淡入动画（仅对顶级窗口有效，子 widget 忽略）
+        try:
+            if widget.isWindow():
+                if self._page_anim:
+                    self._page_anim.stop()
+                widget.setWindowOpacity(0.0)
+                self._page_anim = QPropertyAnimation(widget, b"windowOpacity", self)
+                self._page_anim.setDuration(200)
+                self._page_anim.setStartValue(0.0)
+                self._page_anim.setEndValue(1.0)
+                self._page_anim.setEasingCurve(QEasingCurve.OutCubic)
+                self._page_anim.start()
+        except Exception:
+            pass
 
     def _on_dl_refresh_tick(self):
         """定时器触发：刷新下载列表（下载进行中时持续运行）"""
@@ -490,22 +494,28 @@ class MainWindow(FluentWindow):
 
 
 class HomePage(QWidget):
-    """首页"""
+    """首页 - 显示搜索入口、登录状态、下载统计"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._setup_ui()
+        # 定时刷新统计（每 30 秒）
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self._update_stats)
+        self._refresh_timer.setInterval(30000)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(20)
 
+        # 标题
         title = LargeTitleLabel("🎵 B站下载器")
         subtitle = SubtitleLabel("B站视频下载工具 · 支持高清画质 · 自动获取Cookie")
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
+        # 搜索卡片
         search_card = SimpleCardWidget(self)
         search_layout = QVBoxLayout(search_card)
 
@@ -525,6 +535,7 @@ class HomePage(QWidget):
         search_layout.addLayout(btn_layout)
         layout.addWidget(search_card)
 
+        # 登录状态卡片
         self.login_card = SimpleCardWidget(self)
         login_layout = QVBoxLayout(self.login_card)
         self.login_label = SubtitleLabel("未登录")
@@ -536,25 +547,102 @@ class HomePage(QWidget):
         login_layout.addWidget(self.login_btn)
         layout.addWidget(self.login_card)
 
+        # 统计信息卡片
         info_card = SimpleCardWidget(self)
         info_layout = QHBoxLayout(info_card)
-        for icon, label, value in [("📥", "已下载", "0 个视频"), ("⚡", "下载速度", "0 MB/s"), ("💾", "存储空间", "0 MB")]:
+        info_layout.setSpacing(0)
+
+        # 三个统计项：视频数、音频数、存储空间
+        stat_items = [
+            ("🎬", "已下载视频", "video_count_label"),
+            ("🎵", "已下载音乐", "music_count_label"),
+            ("💾", "占用存储", "size_label"),
+        ]
+        for icon, label_text, attr_name in stat_items:
             item = QWidget()
             item_layout = QVBoxLayout(item)
             item_layout.setContentsMargins(20, 10, 20, 10)
-            i_label = QLabel(icon)
-            i_label.setStyleSheet("font-size: 24px;")
-            i_label.setAlignment(Qt.AlignCenter)
-            v_label = StrongBodyLabel(value)
-            v_label.setAlignment(Qt.AlignCenter)
-            n_label = CaptionLabel(label)
-            n_label.setAlignment(Qt.AlignCenter)
-            item_layout.addWidget(i_label)
-            item_layout.addWidget(v_label)
-            item_layout.addWidget(n_label)
+            item_layout.setSpacing(6)
+
+            icon_label = QLabel(icon)
+            icon_label.setStyleSheet("font-size: 28px;")
+            icon_label.setAlignment(Qt.AlignCenter)
+
+            value_label = StrongBodyLabel("计算中...")
+            value_label.setAlignment(Qt.AlignCenter)
+
+            name_label = CaptionLabel(label_text)
+            name_label.setAlignment(Qt.AlignCenter)
+
+            item_layout.addWidget(icon_label)
+            item_layout.addWidget(value_label)
+            item_layout.addWidget(name_label)
             info_layout.addWidget(item)
+
+            # 保存引用以便后续更新
+            setattr(self, attr_name, value_label)
+
         layout.addWidget(info_card)
         layout.addStretch()
+
+    def showEvent(self, event):
+        """页面显示时刷新统计"""
+        super().showEvent(event)
+        self._update_stats()
+        self._refresh_timer.start()
+
+    def hideEvent(self, event):
+        """页面隐藏时停止定时器"""
+        super().hideEvent(event)
+        self._refresh_timer.stop()
+
+    def _update_stats(self):
+        """更新下载统计信息（视频数、音频数、存储占用）"""
+        from ..utils import scandir_recursive, get_folder_size
+
+        cfg = get_config()
+        base_path = cfg.get(cfg.download_path) or os.path.join(os.getcwd(), "downloads")
+
+        # 视频统计
+        video_path = os.path.join(base_path, "videos")
+        video_count = 0
+        if os.path.isdir(video_path):
+            try:
+                video_count = len(scandir_recursive(video_path, VIDEO_EXTENSIONS))
+            except Exception as e:
+                logger.debug(f"统计视频数失败: {e}")
+
+        # 音频统计
+        music_path = os.path.join(base_path, "musics")
+        music_count = 0
+        if os.path.isdir(music_path):
+            try:
+                music_count = len(scandir_recursive(music_path, AUDIO_EXTENSIONS))
+            except Exception as e:
+                logger.debug(f"统计音频数失败: {e}")
+
+        # 存储统计
+        total_size = 0
+        if os.path.isdir(base_path):
+            try:
+                total_size = get_folder_size(base_path)
+            except Exception as e:
+                logger.debug(f"统计存储大小失败: {e}")
+
+        # 格式化显示
+        def _format_size(size_bytes: int) -> str:
+            if size_bytes >= 1024 ** 3:
+                return f"{size_bytes / (1024 ** 3):.1f} GB"
+            elif size_bytes >= 1024 ** 2:
+                return f"{size_bytes / (1024 ** 2):.1f} MB"
+            elif size_bytes >= 1024:
+                return f"{size_bytes / 1024:.1f} KB"
+            return "0 B"
+
+        # 更新标签
+        self.video_count_label.setText(f"{video_count} 个")
+        self.music_count_label.setText(f"{music_count} 个")
+        self.size_label.setText(_format_size(total_size))
 
     def _do_search(self, keyword: str):
         self.window().search_requested.emit(keyword)
@@ -786,7 +874,10 @@ class SearchPage(QWidget):
         info_layout.setSpacing(2)
         title_text = (video.title or "未知标题")[:50]
         title = BodyLabel(title_text)
-        title.setStyleSheet("font-weight: bold;")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
+        title.setStyleSheet("color: #000000;")  # 标题颜色
         info_layout.addWidget(title)
         views = video.views or 0
         danmaku = video.danmaku_count or 0
@@ -931,7 +1022,6 @@ class SearchPage(QWidget):
         info_layout = QVBoxLayout()
         info_layout.setSpacing(2)
         name_label = StrongBodyLabel(user.get('name', '未知'))
-        name_label.setStyleSheet("font-weight: bold;")
         info_layout.addWidget(name_label)
 
         fans = user.get('fans', 0)
@@ -1138,10 +1228,23 @@ class FavoritesPage(QWidget):
             MessageBox("提示", "请先登录B站账号", self).exec()
             return
 
-        # 停止之前的 worker 线程
+        # 停止之前的 worker 线程（非阻塞方式：用信号通知退出）
         if self._fav_worker and self._fav_worker.isRunning():
             self._fav_worker.quit()
-            self._fav_worker.wait(2000)
+            # 不再阻塞等待，而是安排后续操作在 finished 信号中执行
+            self._fav_worker.finished.connect(self._start_fav_worker)
+            return
+
+        self._start_fav_worker()
+
+    def _start_fav_worker(self):
+        """启动收藏夹加载 worker（确保旧 worker 已停止）"""
+        # 断开之前的 finished 连接（如果有）
+        try:
+            if self._fav_worker:
+                self._fav_worker.finished.disconnect(self._start_fav_worker)
+        except Exception:
+            pass
 
         self.folder_combo.blockSignals(True)
         self.folder_combo.clear()
@@ -1319,7 +1422,9 @@ class FavoritesPage(QWidget):
         info_layout.setSpacing(2)
         title_text = (video.title or "未知标题")[:45]
         title = BodyLabel(title_text)
-        title.setStyleSheet("font-weight: bold;")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
         info_layout.addWidget(title)
         views = video.views or 0
         meta = CaptionLabel(f"👁 {views:,}  ·  👤 {video.owner_name or '未知'}")
@@ -1806,7 +1911,9 @@ class DownloadPage(QWidget):
         if task.episode and task.episode.part:
             title_text += f" - {task.episode.part}"
         name_label = BodyLabel(title_text)
-        name_label.setStyleSheet("font-weight: bold;")
+        font = name_label.font()
+        font.setBold(True)
+        name_label.setFont(font)
         info_layout.addWidget(name_label)
 
         progress_bar = QProgressBar()
@@ -2163,6 +2270,58 @@ class SettingsPage(QWidget):
         cookie_layout.addWidget(self.cookie_status)
         layout.addWidget(cookie_card)
 
+        # AI 翻译设置
+        ai_card = SimpleCardWidget(container)
+        ai_layout = QVBoxLayout(ai_card)
+        ai_title = SubtitleLabel("🤖 AI 翻译设置")
+        ai_layout.addWidget(ai_title)
+
+        ai_desc = CaptionLabel("配置 DeepSeek API Key 后可获得 AI 级歌词翻译（自然流畅、润色后中文）。\n留空则使用百度翻译。")
+        ai_desc.setWordWrap(True)
+        ai_layout.addWidget(ai_desc)
+
+        key_row = QHBoxLayout()
+        key_row.addWidget(BodyLabel("DeepSeek API Key"))
+        self.deepseek_key_edit = LineEdit()
+        self.deepseek_key_edit.setPlaceholderText("输入你的 DeepSeek API Key")
+        self.deepseek_key_edit.setText(cfg().get(cfg().deepseek_api_key))
+        self.deepseek_key_edit.setClearButtonEnabled(True)
+        key_row.addWidget(self.deepseek_key_edit, 1)
+
+        save_key_btn = PrimaryPushButton("保存")
+        save_key_btn.clicked.connect(self._save_deepseek_key)
+        key_row.addWidget(save_key_btn)
+
+        from qfluentwidgets import HyperlinkLabel
+        get_key_link = HyperlinkLabel("免费获取 DeepSeek API Key")
+        get_key_link.setUrl("https://platform.deepseek.com/api_keys")
+        key_row.addWidget(get_key_link)
+
+        ai_layout.addLayout(key_row)
+
+        # 百度翻译设置
+        baidu_row = QHBoxLayout()
+        baidu_row.addWidget(BodyLabel("百度翻译 AppID"))
+        self.baidu_appid_edit = LineEdit()
+        self.baidu_appid_edit.setPlaceholderText("百度翻译应用 AppID")
+        self.baidu_appid_edit.setText(cfg().get(cfg().baidu_translate_appid))
+        baidu_row.addWidget(self.baidu_appid_edit, 1)
+        ai_layout.addLayout(baidu_row)
+
+        baidu_secret_row = QHBoxLayout()
+        baidu_secret_row.addWidget(BodyLabel("百度翻译密钥"))
+        self.baidu_secret_edit = LineEdit()
+        self.baidu_secret_edit.setPlaceholderText("百度翻译应用密钥")
+        self.baidu_secret_edit.setText(cfg().get(cfg().baidu_translate_secret))
+        baidu_secret_row.addWidget(self.baidu_secret_edit, 1)
+
+        save_baidu_btn = PushButton("保存百度翻译")
+        save_baidu_btn.clicked.connect(self._save_baidu_creds)
+        baidu_secret_row.addWidget(save_baidu_btn)
+
+        ai_layout.addLayout(baidu_secret_row)
+        layout.addWidget(ai_card)
+
         # 关于
         about_card = SimpleCardWidget(container)
         about_layout = QVBoxLayout(about_card)
@@ -2209,8 +2368,10 @@ class SettingsPage(QWidget):
     def _setup_hotkey_labels(self, layout):
         """初始化快捷键显示标签"""
         import json as _json
+        from ..config import get_config
+        cfg = get_config()
         try:
-            hk = _json.loads(cfg().get(cfg().global_hotkeys))
+            hk = _json.loads(cfg.get(cfg.global_hotkeys))
         except Exception:
             hk = {}
         names = {
@@ -2235,8 +2396,10 @@ class SettingsPage(QWidget):
     def _update_hotkey_labels(self):
         """更新快捷键显示标签文本"""
         import json as _json
+        from ..config import get_config
+        cfg = get_config()
         try:
-            hk = _json.loads(cfg().get(cfg().global_hotkeys))
+            hk = _json.loads(cfg.get(cfg.global_hotkeys))
         except Exception:
             hk = {}
         for key, lbl in self._hk_rows.items():
@@ -2287,3 +2450,17 @@ class SettingsPage(QWidget):
             user_name = cfg().get(cfg().user_name) or "未知用户"
             return f"✅ 已登录为: {user_name}"
         return "❌ 未登录"
+
+    def _save_deepseek_key(self):
+        """保存 DeepSeek API Key"""
+        key = self.deepseek_key_edit.text().strip()
+        cfg().set(cfg().deepseek_api_key, key)
+        InfoBar.success("已保存", "DeepSeek API Key 已保存，下次翻译时生效", duration=3000, parent=self)
+
+    def _save_baidu_creds(self):
+        """保存百度翻译凭证"""
+        appid = self.baidu_appid_edit.text().strip()
+        secret = self.baidu_secret_edit.text().strip()
+        cfg().set(cfg().baidu_translate_appid, appid)
+        cfg().set(cfg().baidu_translate_secret, secret)
+        InfoBar.success("已保存", "百度翻译凭证已保存，下次翻译时生效", duration=3000, parent=self)

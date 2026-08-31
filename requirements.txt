@@ -1,5 +1,9 @@
-requests>=2.31.0
-ffmpeg-python>=0.2.0
-tqdm>=4.66.0
+PySide6>=6.6.0
+PySide6-Fluent-Widgets>=1.5.0
+httpx>=0.26.0
+mutagen>=1.47.0
+pynput>=1.7.6
 cryptography>=42.0.0
-websocket-client>=1.6.0
+qrcode>=7.4.0
+pillow>=10.0.0
+ffmpeg-python>=0.2.0

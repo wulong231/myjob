@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     TabWidget, BodyLabel, SubtitleLabel, CaptionLabel,
     StrongBodyLabel, PrimaryPushButton, PushButton,
-    ComboBox, CheckBox, FluentIcon as FIcon, InfoBar,
+    ComboBox, CheckBox, FluentIcon as FIcon, InfoBar, isDarkTheme,
 )
 
 from ..models import VideoInfo, EpisodeInfo, DownloadTask, MediaType, VideoQuality
@@ -70,6 +70,10 @@ class VideoDetailDialog(QDialog):
         return None
 
     def _setup_ui(self):
+        # 设置对话框背景色，匹配 qfluentwidgets 主题
+        bg = "#282828" if isDarkTheme() else "#F0F0F0"
+        self.setStyleSheet(f"QDialog {{ background: {bg}; }}")
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
@@ -109,6 +113,7 @@ class VideoDetailDialog(QDialog):
         self.episode_list = QListWidget()
         self.episode_list.setSelectionMode(QAbstractItemView.MultiSelection)
         self.episode_list.setMaximumHeight(220)
+        self.episode_list.setStyleSheet("QListWidget { background: transparent; border: 1px solid #ccc; border-radius: 4px; }")
         self._populate_episodes()
         layout.addWidget(self.episode_list)
 

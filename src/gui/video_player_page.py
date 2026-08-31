@@ -5,15 +5,17 @@
 """
 import os
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+from ..utils import scandir_recursive, get_folder_size
 
 from PySide6.QtCore import Qt, QTimer, QUrl, QSize, QThread, Signal
-from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon, QPixmap, QImage, QColor
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon, QPixmap, QImage, QColor, QPalette
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QSlider, QLabel, QSizePolicy, QMenu, QFileDialog, QMessageBox,
     QSpacerItem, QApplication, QTabWidget, QDialog, QFrame, QInputDialog,
-    QSplitter,
+    QSplitter, QCheckBox,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -169,7 +171,7 @@ class VideoTagEditDialog(QDialog):
 
         self.empty_tag_hint = CaptionLabel("暂无标签，请在下方添加")
         self.empty_tag_hint.setAlignment(Qt.AlignCenter)
-        empty_color = "#999" if isDarkTheme() else "gray"
+        empty_color = "#999" if isDarkTheme() else "gray"  # COLOR-1: 空状态提示文字颜色（深色#999 / 浅色gray）
         self.empty_tag_hint.setStyleSheet(f"color: {empty_color}; padding: 4px;")
         layout.addWidget(self.empty_tag_hint)
 
@@ -263,7 +265,7 @@ class VideoTagEditDialog(QDialog):
         if not presets:
             hint = CaptionLabel("该分类无预设标签，请直接输入")
             hint.setAlignment(Qt.AlignCenter)
-            empty_color = "#999" if isDarkTheme() else "gray"
+            empty_color = "#999" if isDarkTheme() else "gray"  # COLOR-2: 空状态提示文字颜色（深色#999 / 浅色gray）
             hint.setStyleSheet(f"color: {empty_color}; padding: 4px;")
             self.preset_flow.addWidget(hint)
             return
@@ -385,7 +387,8 @@ class VideoPlayerPage(QWidget):
 
         # 标题栏
         title_row = QHBoxLayout()
-        title_row.addWidget(StrongBodyLabel("视频播放器"))
+        page_title = StrongBodyLabel("视频播放器")
+        title_row.addWidget(page_title)
         title_row.addStretch()
 
         # 全屏按钮
@@ -413,13 +416,27 @@ class VideoPlayerPage(QWidget):
 
         # 顶部操作栏
         list_header = QHBoxLayout()
-        list_header.addWidget(CaptionLabel("视频库"))
+        list_header_lbl = CaptionLabel("视频库")
+        list_header.addWidget(list_header_lbl)
         list_header.addStretch()
 
         self.rescan_btn = ToolButton(FIcon.SYNC, self)
         self.rescan_btn.setToolTip("刷新视频列表")
         self.rescan_btn.setFixedSize(28, 28)
         list_header.addWidget(self.rescan_btn)
+
+        self.clean_video_btn = ToolButton(FIcon.DELETE, self)
+        self.clean_video_btn.setToolTip("清理空视频文件")
+        self.clean_video_btn.setFixedSize(28, 28)
+        list_header.addWidget(self.clean_video_btn)
+
+        # 自动播放开关
+        self.auto_play_check = QCheckBox("自动连播", self)
+        self.auto_play_check.setToolTip("当前视频播放结束后自动播放下一个")
+        from ..config import get_config
+        self.auto_play_check.setChecked(get_config().get(get_config().video_auto_play))
+        self.auto_play_check.stateChanged.connect(self._on_auto_play_changed)
+        list_header.addWidget(self.auto_play_check)
 
         list_layout.addLayout(list_header)
 
@@ -553,13 +570,21 @@ class VideoPlayerPage(QWidget):
         v_splitter.setChildrenCollapsible(False)
         v_splitter.setHandleWidth(6)
 
-        # 视频显示窗口
-        video_card = SimpleCardWidget(self)
-        video_card_layout = QVBoxLayout(video_card)
+        # 视频显示窗口 - 使用普通 QWidget 避免 SimpleCardWidget 自绘背景/边框
+        self.video_card = QWidget(self)
+        video_card_bg = "#000000" if isDarkTheme() else "#E0E0E0"  # BG-1: 视频容器背景色（深色#000000 / 浅色#E0E0E0）
+        self.video_card.setStyleSheet(f"QWidget#videoCard{{background:{video_card_bg};border:none;border-radius:0px;}}")
+        self.video_card.setObjectName("videoCard")
+        video_card_layout = QVBoxLayout(self.video_card)
         video_card_layout.setContentsMargins(0, 0, 0, 0)
 
         self.video_widget = QVideoWidget(self)
         self.video_widget.setMinimumSize(480, 270)
+        # 使用 QPalette 设置 QVideoWidget 背景色（兼容所有 PySide6 版本）
+        pal = self.video_widget.palette()
+        pal.setColor(QPalette.Window, QColor(video_card_bg))  # BG-2: 视频播放器背景色（与BG-1同步）
+        self.video_widget.setPalette(pal)
+        self.video_widget.setAutoFillBackground(True)
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._player.setVideoOutput(self.video_widget)
         video_card_layout.addWidget(self.video_widget)
@@ -568,7 +593,7 @@ class VideoPlayerPage(QWidget):
         self._fullscreen_window: Optional[QWidget] = None
         self._fullscreen_video_widget: Optional[QVideoWidget] = None
 
-        v_splitter.addWidget(video_card)
+        v_splitter.addWidget(self.video_card)
 
         # 控制栏
         controls_card = SimpleCardWidget(self)
@@ -647,8 +672,7 @@ class VideoPlayerPage(QWidget):
         # 空状态提示
         self.empty_hint = CaptionLabel("📭 暂无视频文件\n下载的视频将自动保存在 downloads/videos/ 目录")
         self.empty_hint.setAlignment(Qt.AlignCenter)
-        empty_hint_color = "#999" if isDarkTheme() else "gray"
-        self.empty_hint.setStyleSheet(f"color: {empty_hint_color}; padding: 20px;")
+        self.empty_hint.setStyleSheet("padding: 20px;")
         self.empty_hint.setVisible(False)
         main_layout.addWidget(self.empty_hint)
 
@@ -662,6 +686,7 @@ class VideoPlayerPage(QWidget):
         self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
         self.open_btn.clicked.connect(self._open_file)
         self.rescan_btn.clicked.connect(self._scan_video_files)
+        self.clean_video_btn.clicked.connect(self._clean_empty_videos)
         self.speed_btn.clicked.connect(self._cycle_speed)
 
         self.video_list.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -717,8 +742,45 @@ class VideoPlayerPage(QWidget):
         os.makedirs(video_path, exist_ok=True)
         return video_path
 
+    def _clean_empty_videos(self):
+        """清理空视频文件和空目录"""
+        video_path = self._get_video_path()
+        if not os.path.isdir(video_path):
+            return
+
+        from qfluentwidgets import InfoBar
+        deleted_files = 0
+        deleted_dirs = 0
+
+        for root, dirs, files in os.walk(video_path, topdown=False):
+            for name in files:
+                if name.lower().endswith(VIDEO_EXTENSIONS):
+                    path = os.path.join(root, name)
+                    try:
+                        if os.path.getsize(path) == 0:
+                            os.remove(path)
+                            deleted_files += 1
+                    except Exception:
+                        pass
+            try:
+                if root != video_path and not os.listdir(root):
+                    os.rmdir(root)
+                    deleted_dirs += 1
+            except Exception:
+                pass
+
+        if deleted_files > 0 or deleted_dirs > 0:
+            InfoBar.success(
+                "清理完成",
+                f"删除 {deleted_files} 个空视频文件，{deleted_dirs} 个空目录",
+                duration=3000, parent=self
+            )
+            self._scan_video_files()
+        else:
+            InfoBar.info("无需清理", "未发现空文件或空目录", duration=2000, parent=self)
+
     def _scan_video_files(self):
-        """扫描视频文件"""
+        """扫描视频文件（使用 scandir_recursive 加速）"""
         self.video_list.clear()
         self._playlist.clear()
         self._current_index = -1
@@ -733,12 +795,7 @@ class VideoPlayerPage(QWidget):
 
         found: List[str] = []
         try:
-            for root, _dirs, files in os.walk(video_path):
-                for name in files:
-                    if name.lower().endswith(VIDEO_EXTENSIONS):
-                        full_path = os.path.join(root, name)
-                        if os.path.isfile(full_path):
-                            found.append(full_path)
+            found = scandir_recursive(video_path, VIDEO_EXTENSIONS)
         except Exception as e:
             logger.error(f"扫描视频文件失败: {e}")
 
@@ -768,10 +825,14 @@ class VideoPlayerPage(QWidget):
         self.video_list.setVisible(not empty)
 
     def _on_theme_changed(self):
-        """主题切换时刷新颜色"""
-        empty_hint_color = "#999" if isDarkTheme() else "gray"
-        self.empty_hint.setStyleSheet(f"color: {empty_hint_color}; padding: 20px;")
-        # 刷新视频列表以更新封面背景色
+        """主题切换时刷新样式"""
+        # 刷新视频窗口背景色
+        if hasattr(self, 'video_widget'):
+            video_card_bg = "#000000" if isDarkTheme() else "#E0E0E0"  # BG-3: 主题切换时视频背景色（与BG-1/BG-2同步）
+            self.video_card.setStyleSheet(f"QWidget#videoCard{{background:{video_card_bg};border:none;border-radius:6px;}}")
+            pal = self.video_widget.palette()
+            pal.setColor(QPalette.Window, QColor(video_card_bg))
+            self.video_widget.setPalette(pal)
         self._update_list_from_playlist()
 
     def _toggle_play(self):
@@ -908,17 +969,41 @@ class VideoPlayerPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._fullscreen_video_widget = QVideoWidget(self._fullscreen_window)
+        pal = self._fullscreen_video_widget.palette()
+        pal.setColor(QPalette.Window, QColor("#000000"))  # BG-4: 全屏视频窗口背景色（固定黑色）
+        self._fullscreen_video_widget.setPalette(pal)
+        self._fullscreen_video_widget.setAutoFillBackground(True)
         layout.addWidget(self._fullscreen_video_widget)
 
         # 将视频输出切换到全屏窗口
         self._player.setVideoOutput(self._fullscreen_video_widget)
 
-        # ESC 退出全屏
+        # 为全屏窗口注册所有快捷键（与主界面保持一致）
         QShortcut(QKeySequence(Qt.Key_Escape), self._fullscreen_window,
                   activated=self._exit_fullscreen)
-        # 空格暂停
         QShortcut(QKeySequence(Qt.Key_Space), self._fullscreen_window,
                   activated=self._toggle_play)
+        QShortcut(QKeySequence(Qt.Key_Left), self._fullscreen_window,
+                  activated=self._play_prev)
+        QShortcut(QKeySequence(Qt.Key_Right), self._fullscreen_window,
+                  activated=self._play_next)
+        QShortcut(QKeySequence(Qt.Key_Up), self._fullscreen_window,
+                  activated=self._volume_up)
+        QShortcut(QKeySequence(Qt.Key_Down), self._fullscreen_window,
+                  activated=self._volume_down)
+        QShortcut(QKeySequence(Qt.Key_M), self._fullscreen_window,
+                  activated=self._toggle_mute_key)
+        QShortcut(QKeySequence(Qt.Key_F), self._fullscreen_window,
+                  activated=self._toggle_fullscreen)
+        QShortcut(QKeySequence("Ctrl+Left"), self._fullscreen_window,
+                  activated=self._seek_backward)
+        QShortcut(QKeySequence("Ctrl+Right"), self._fullscreen_window,
+                  activated=self._seek_forward)
+        # 数字键跳转百分比
+        for i in range(10):
+            key = getattr(Qt, f"Key_{i}")
+            QShortcut(QKeySequence(key), self._fullscreen_window,
+                      activated=lambda i=i: self._seek_percent(i * 10))
 
         self._fullscreen_window.showFullScreen()
 
@@ -966,7 +1051,7 @@ class VideoPlayerPage(QWidget):
         thumbnail.setObjectName("video_thumbnail")
         thumbnail.setFixedSize(QSize(90, 50))
         thumbnail.setAlignment(Qt.AlignCenter)
-        thumb_bg = "#3C3C3C" if isDarkTheme() else "#E8ECF4"
+        thumb_bg = "#3C3C3C" if isDarkTheme() else "#E8ECF4"  # BG-5: 视频缩略图背景色（深色#3C3C3C / 浅色#E8ECF4）
         thumbnail.setStyleSheet(f"background: {thumb_bg}; border-radius: 6px; font-size: 24px;")
         layout.addWidget(thumbnail)
 
@@ -991,7 +1076,9 @@ class VideoPlayerPage(QWidget):
         info_layout.setSpacing(2)
         display_name = os.path.splitext(os.path.basename(path))[0]
         title = BodyLabel(display_name[:40])
-        title.setStyleSheet("font-weight: bold;")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
         info_layout.addWidget(title)
 
         # 文件大小
@@ -1020,7 +1107,7 @@ class VideoPlayerPage(QWidget):
             tag_row.addWidget(self._make_mini_badge(t["tag"], t.get("category", "自定义")))
         if len(tags) > max_show:
             more = QLabel(f"+{len(tags) - max_show}")
-            more.setStyleSheet("color: gray; font-size: 10px;")
+            more.setStyleSheet("color: gray; font-size: 10px;")  # COLOR-3: 更多信息文字颜色（固定gray）
             tag_row.addWidget(more)
         tag_row.addStretch()
         info_layout.addLayout(tag_row)
@@ -1282,7 +1369,7 @@ class VideoPlayerPage(QWidget):
         super().closeEvent(event)
 
     def _on_media_status_changed(self, status):
-        """媒体状态变化：播放结束时清除进度记录"""
+        """媒体状态变化：播放结束时自动播放下一个"""
         from PySide6.QtMultimedia import QMediaPlayer
         if status == QMediaPlayer.EndOfMedia:
             try:
@@ -1292,6 +1379,17 @@ class VideoPlayerPage(QWidget):
                     get_database().clear_position(path)
             except Exception:
                 pass
+
+            # 自动连播：检查是否开启自动播放
+            from ..config import get_config
+            if get_config().get(get_config().video_auto_play) and self.auto_play_check.isChecked():
+                self._play_next()
+
+    def _on_auto_play_changed(self, state):
+        """自动播放开关变化时保存配置"""
+        from ..config import get_config
+        get_config().set(get_config().video_auto_play, bool(state))
+        logger.debug(f"视频自动连播: {'开启' if state else '关闭'}")
 
     # ------------------------------------------------------------------
     # 按UP主分类
@@ -1449,7 +1547,7 @@ class VideoPlayerPage(QWidget):
                 font = header.font()
                 font.setBold(True)
                 header.setFont(font)
-                color = TAG_CATEGORY_COLORS.get(cat, "#607D8B")
+                color = TAG_CATEGORY_COLORS.get(cat, "#607D8B")  # COLOR-4: 标签分类标题颜色（来自TAG_CATEGORY_COLORS字典）
                 header.setForeground(QColor(color))
                 self.tag_list.addItem(header)
 

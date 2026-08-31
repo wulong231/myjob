@@ -16,6 +16,7 @@ from typing import Optional, Callable, List
 from .config import get_config
 from .network import download_chunk, download_file, get_client
 from .models import DownloadTask, DownloadStatus, MediaType, EpisodeInfo, VideoInfo
+from .utils import safe_makedirs, safe_delete
 
 logger = logging.getLogger(__name__)
 
@@ -780,73 +781,137 @@ class BilibiliDownloader:
 
     def _download_danmaku(self, task: DownloadTask):
         """下载弹幕"""
-        from .bilibili_api import BilibiliClient
+        try:
+            from .bilibili_api import BilibiliClient
 
-        client = BilibiliClient()
-        danmaku_data = client.get_danmaku(task.episode.cid)
+            client = BilibiliClient()
+            danmaku_data = client.get_danmaku(task.episode.cid)
 
-        output_dir = _cfg().get(_cfg().download_path)
-        uploader_dir = os.path.join(output_dir, self._sanitize_filename(task.video_info.owner_name))
-        os.makedirs(uploader_dir, exist_ok=True)
+            if not danmaku_data:
+                raise RuntimeError("弹幕数据为空")
 
-        base_name = self._build_filename(task)
-        danmaku_path = os.path.join(uploader_dir, f"{base_name}.xml")
+            output_dir = _cfg().get(_cfg().download_path)
+            uploader_dir = os.path.join(output_dir, self._sanitize_filename(task.video_info.owner_name))
+            safe_makedirs(uploader_dir)
 
-        with open(danmaku_path, "wb") as f:
-            f.write(danmaku_data)
+            base_name = self._build_filename(task)
+            danmaku_path = os.path.join(uploader_dir, f"{base_name}.xml")
 
-        task.file_path = danmaku_path
-        task.status = DownloadStatus.COMPLETED
+            with open(danmaku_path, "wb") as f:
+                f.write(danmaku_data)
+
+            task.file_path = danmaku_path
+            task.status = DownloadStatus.COMPLETED
+            logger.info(f"弹幕下载完成: {danmaku_path}")
+        except Exception as e:
+            logger.error(f"弹幕下载失败: {e}")
+            task.status = DownloadStatus.FAILED
+            task.error_message = str(e)
 
     def _download_cover(self, task: DownloadTask):
         """下载封面"""
-        output_dir = _cfg().get(_cfg().download_path)
-        uploader_dir = os.path.join(output_dir, self._sanitize_filename(task.video_info.owner_name))
-        os.makedirs(uploader_dir, exist_ok=True)
+        try:
+            if not task.video_info or not task.video_info.cover_url:
+                raise RuntimeError("没有封面 URL")
 
-        base_name = self._build_filename(task)
-        cover_path = os.path.join(uploader_dir, f"{base_name}.jpg")
+            output_dir = _cfg().get(_cfg().download_path)
+            uploader_dir = os.path.join(output_dir, self._sanitize_filename(task.video_info.owner_name))
+            safe_makedirs(uploader_dir)
 
-        download_file(task.video_info.cover_url, cover_path)
-        task.file_path = cover_path
-        task.status = DownloadStatus.COMPLETED
+            base_name = self._build_filename(task)
+            cover_path = os.path.join(uploader_dir, f"{base_name}.jpg")
+
+            success = download_file(task.video_info.cover_url, cover_path)
+            if not success:
+                raise RuntimeError("封面下载失败")
+
+            task.file_path = cover_path
+            task.status = DownloadStatus.COMPLETED
+            logger.info(f"封面下载完成: {cover_path}")
+        except Exception as e:
+            logger.error(f"封面下载失败: {e}")
+            task.status = DownloadStatus.FAILED
+            task.error_message = str(e)
 
     def _merge_video_audio(self, video_path: str, audio_path: str, output_path: str):
-        """合并音视频"""
-        try:
-            import ffmpeg
+        """合并音视频（自动重试）"""
+        # 先找到 ffmpeg 可执行文件路径
+        ffmpeg_bin = self._find_ffmpeg()
+        if not ffmpeg_bin:
+            logger.warning("ffmpeg 未找到，无法合并音视频")
+            import shutil
+            shutil.copy2(video_path, output_path)
+            logger.warning(f"已复制视频文件（无音频）: {output_path}")
+            return
 
-            (
-                ffmpeg
-                .input(video_path)
-                .input(audio_path)
-                .output(
-                    output_path,
-                    vcodec="copy",
-                    acodec="copy",
-                    movflags="faststart",
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            # 优先尝试 ffmpeg-python 库（会有更好的错误信息）
+            try:
+                import ffmpeg
+                # 设置 ffmpeg 二进制路径，确保打包后也能找到
+                os.environ["PATH"] = os.pathsep.join([
+                    os.path.dirname(ffmpeg_bin),
+                    os.environ.get("PATH", "")
+                ])
+                (
+                    ffmpeg
+                    .input(video_path)
+                    .input(audio_path)
+                    .output(
+                        output_path,
+                        vcodec="copy",
+                        acodec="copy",
+                        movflags="faststart",
+                    )
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True, timeout=300)
                 )
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True)
-            )
-            logger.info(f"音视频合并成功: {output_path}")
-        except ImportError:
-            # ffmpeg-python 不可用时使用系统命令
+                logger.info(f"音视频合并成功: {output_path}")
+                return
+            except ImportError:
+                pass
+            except Exception as e:
+                logger.warning(f"ffmpeg-python 合并失败: {e}")
+
+            # 回退：使用命令行直接调用
             import subprocess
             cmd = [
-                "ffmpeg", "-y",
+                ffmpeg_bin, "-y",
                 "-i", video_path,
                 "-i", audio_path,
                 "-c", "copy",
                 "-movflags", "+faststart",
                 output_path
             ]
-            subprocess.run(cmd, capture_output=True, timeout=300)
-            logger.info(f"音视频合并成功（命令行）: {output_path}")
-        except Exception as e:
-            logger.warning(f"音视频合并失败: {e}，尝试直接复制视频")
-            import shutil
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=300)
+                if result.returncode == 0:
+                    logger.info(f"音视频合并成功（命令行）: {output_path}")
+                    return
+                logger.warning(f"ffmpeg 命令行合并失败 (code={result.returncode}): {result.stderr[:200]}")
+            except subprocess.TimeoutExpired:
+                logger.warning("ffmpeg 合并超时")
+            except FileNotFoundError:
+                logger.warning(f"ffmpeg 未找到: {ffmpeg_bin}")
+                break
+            except Exception as e:
+                logger.warning(f"ffmpeg 命令行合并异常: {e}")
+
+            if attempt < max_attempts - 1:
+                wait = (attempt + 1) * 2
+                logger.info(f"等待{wait}秒后重试合并...")
+                time.sleep(wait)
+
+        # 所有合并尝试失败，直接复制视频文件
+        logger.warning(f"音视频合并失败，使用视频文件作为最终结果: {video_path}")
+        import shutil
+        try:
             shutil.copy2(video_path, output_path)
+            logger.info(f"已复制视频文件: {output_path}")
+        except Exception as e:
+            logger.error(f"复制视频文件失败: {e}")
+            raise RuntimeError(f"音视频合并失败，且无法复制视频: {e}")
 
     def _build_filename(self, task: DownloadTask) -> str:
         """构建文件名"""
@@ -864,12 +929,21 @@ class BilibiliDownloader:
         return title
 
     def _sanitize_filename(self, name: str) -> str:
-        """清理文件名中的非法字符"""
+        """清理文件名中的非法字符，确保生成的文件名在任何文件系统上都安全"""
+        if not name or not isinstance(name, str):
+            return "untitled"
+        # 替换非法字符
         invalid_chars = '<>:"/\\|?*\x00-\x1f'
         for char in invalid_chars:
             name = name.replace(char, '_')
+        # 去除首尾的空格和点（Windows 不允许文件名以点结尾）
         name = name.strip('. ')
-        return name[:200] if len(name) > 200 else name
+        # 限制长度（Windows 最大 255 字符，留余量）
+        name = name[:200] if len(name) > 200 else name
+        # 防止空文件名
+        if not name:
+            name = "untitled"
+        return name
 
 
 def create_downloader() -> BilibiliDownloader:

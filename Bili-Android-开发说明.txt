@@ -1,0 +1,233 @@
+========================================================
+Bili（安卓版）开发与修改说明
+========================================================
+更新日期：2026-08-30
+版本：v1.1.0（versionCode 2）
+
+--------------------------------------------------------
+一、项目概述
+--------------------------------------------------------
+Bili 是一款基于 B 站开放接口的第三方视频/音频下载与播放器
+（安卓版），支持搜索、在线播放、视频/音频下载、本地播放、
+播放列表分类、歌词、深色模式等功能。
+
+桌面版（PySide6）与安卓版（Kotlin + Jetpack Compose）共用
+B 站接口逻辑思路，但代码相互独立。
+
+--------------------------------------------------------
+二、安卓工程目录结构
+--------------------------------------------------------
+android/
+├── app/
+│   ├── src/main/
+│   │   ├── java/com/bili23/android/
+│   │   │   ├── MainActivity.kt        # 入口 + 底部导航 + 侧边栏抽屉 + 路由
+│   │   │   ├── Bili23App.kt           # Application（Coil 图片加载器，带 B 站 UA）
+│   │   │   ├── data/
+│   │   │   │   ├── BiliApi.kt         # B 站 API（搜索/详情/DASH/WBI/收藏/歌词）
+│   │   │   │   ├── DownloadManager.kt # 下载（DASH 流 + MediaMuxer 合并 + 封面）
+│   │   │   │   ├── Models.kt          # 数据模型（VideoInfo/DownloadTask/AudioItem...）
+│   │   │   │   ├── Settings.kt        # SharedPreferences 设置 + 播放列表 + 收藏
+│   │   │   │   └── WbiSigner.kt       # WBI 签名（注意 ASCII 校验）
+│   │   │   ├── service/
+│   │   │   │   └── MusicPlaybackService.kt  # 音频前台服务（通知栏/播放模式/封面/seek）
+│   │   │   ├── ui/
+│   │   │   │   ├── AppViewModel.kt    # 全局状态与业务逻辑
+│   │   │   │   ├── Theme.kt           # 主题（深浅色 + 状态栏图标同步）
+│   │   │   │   └── screens/           # 各页面
+│   │   │   │       ├── HomeScreen.kt          # 首页（统计 + 快捷入口）
+│   │   │   │       ├── SearchScreen.kt        # 搜索
+│   │   │   │       ├── VideoDetailScreen.kt   # 视频详情（分P/画质/下载）
+│   │   │   │       ├── VideoPlayerScreen.kt   # 视频播放（横屏/队列/模式/seek）
+│   │   │   │       ├── LocalVideoScreen.kt    # 本地视频（多选/收藏/加列表）
+│   │   │   │       ├── AudioPlayerScreen.kt   # 音频播放（封面/歌词/模式/seek/多选）
+│   │   │   │       ├── DownloadsScreen.kt     # 下载管理（清空历史）
+│   │   │   │       ├── PlaylistsScreen.kt     # 播放列表（新建/详情/播放全部/加入列表弹窗）
+│   │   │   │       ├── LocalFavoritesScreen.kt # 本地收藏（默认“我的收藏”列表）
+│   │   │   │       ├── FavoritesScreen.kt     # B 站账号收藏夹（需登录）
+│   │   │   │       ├── LoginScreen.kt         # 登录（二维码 + Cookie）
+│   │   │   │       └── SettingsScreen.kt      # 设置（主题/画质/目录/Cookie）
+│   │   ├── res/values/strings.xml    # 应用名 = Bili
+│   │   └── AndroidManifest.xml       # 权限 + 前台服务声明
+│   └── build.gradle.kts              # 依赖 + 签名（release 用 bili23-release.jks）
+├── keystore/bili23-release.jks       # 签名文件（bili23/bili23123）
+└── Bili23-release.apk                # 构建工作副本（正式包放在 安装包/ 下）
+
+工程根目录（bi23/）：
+- 安装包/                 # 正式 APK 归档（旧版本放 安装包/旧版本/）
+- android-sdk/ gradle-dist/  # 本地构建工具链（勿动）
+- src/ main.py 桌面版源码；dist/ Bili23.exe 桌面版产物
+
+--------------------------------------------------------
+三、技术栈
+--------------------------------------------------------
+- Kotlin + Jetpack Compose（Material 3）
+- 网络：OkHttp（带 UA/Referer/Cookie）
+- 播放：Media3 ExoPlayer（视频 DASH 合并、音频前台服务）
+- 图片：Coil（本地文件封面、网络封面）
+- 下载合并：MediaMuxer（视频+音频流合成 MP4）
+- 持久化：SharedPreferences（Settings 单例）
+- 兼容：minSdk 26（Android 8.0）~ targetSdk 36（Android 16）
+
+--------------------------------------------------------
+四、核心功能与关键实现
+--------------------------------------------------------
+1. 搜索 / 视频详情 / 在线播放
+   - BiliApi.getVideoInfo() 详情，getPlayUrl() 拿 DASH 地址
+   - 播放用 ExoPlayer MergingMediaSource 合并视频+音频流
+   - WBI 签名（WbiSigner）注意：isLetterOrDigit() 对中文返回
+     true，须用 ASCII 判断，否则签名失败
+
+2. 下载
+   - 视频：并行下载视频流(.m4v)+音频流(.m4a)，MediaMuxer 合并 MP4
+   - 音频：仅下 DASH 音频流存 M4A
+   - 封面：下载后自动把 B 站封面存成同名 .jpg（供播放器显示）
+   - 下载目录可改（设置页），改后重建 DownloadManager
+
+3. 音频播放（MusicPlaybackService 前台服务）
+   - 通知栏控制（播放/暂停/上一首/下一首），息屏可播
+   - 播放模式：顺序 / 列表循环 / 单曲循环 / 随机（playMode 0-3）
+   - 播放列表：ACTION_SET_PLAYLIST 传入 paths/titles/artists/covers
+   - seek：ACTION_SEEK；停止：ACTION_STOP（播放视频前调用避免冲突）
+   - 封面：MediaMetadata artworkUri + 通知大图标
+   - 歌词：自动匹配（先读缓存，再按歌名搜网易云取第一条）+ 手动搜索
+     + 滚动高亮 + 点击跳转 + 偏移微调
+
+4. 视频播放器
+   - 横屏自动全屏（isLandscape 检测），旋转后隐藏系统栏铺满画面
+   - 播放模式：顺序/列表循环/单曲循环/随机（Settings.videoPlayMode）
+   - 队列播放：vm.setVideoQueue(paths, index)，播完自动切集
+   - 自绘控制条：播放/暂停 + 拖拽 seek（dragging 状态，松手才 seek）
+   - 全屏时底部悬浮半透明控制条
+
+5. 播放列表（命名分类）
+   - 存储：Settings.getPlaylists() 返回 LinkedHashMap<名称, 路径列表>
+     （JSON 序列化到 SharedPreferences，键 playlists_json）
+   - 默认列表“我的收藏”：收藏星标 = 加入/移出该列表
+   - 老版本收藏（favorites StringSet）自动迁移到“我的收藏”
+   - 页面：播放列表列表页 + 详情页（播放全部音频/视频、移出、重命名、删除）
+   - 加入列表：音频/视频列表项上的“+列表”按钮弹窗勾选/新建
+
+6. 主题（深色模式）
+   - Settings.themeModeState（Compose 可观察），切换立即生效
+   - Theme.applySystemBarTheme() 同步状态栏/导航栏图标深浅
+   - 注意：视频播放器用 WindowInsetsControllerCompat（勿用旧
+     systemUiVisibility，会清掉浅色图标标志）
+
+7. 侧边栏
+   - MainActivity 的 ModalNavigationDrawer + DrawerController
+   - 各主页面左上角 DrawerMenuButton 打开
+
+--------------------------------------------------------
+五、数据存储（Settings.kt 键位速查）
+--------------------------------------------------------
+- download_dir      下载目录名（默认 Download）
+- default_quality   默认画质（100=1080P）
+- theme_mode        0跟随系统 / 1浅色 / 2深色
+- video_play_mode   0顺序 / 1列表循环 / 2单曲循环 / 3随机
+- cookie            B 站 Cookie
+- nickname          昵称（可选）
+- audio_tag_<path>  音频标签 "歌名|歌手"
+- lyric_<path>      歌词缓存（LRC 文本）
+- playlists_json    播放列表 JSON：{"列表名":["路径",...]}
+  * 默认“我的收藏”列表承接收藏；旧 favorites 键迁移后删除
+- favorites（旧版） 已废弃，仅用于迁移
+
+--------------------------------------------------------
+六、构建与打包（重要）
+--------------------------------------------------------
+构建命令（在 android/ 目录下）：
+  .\gradlew.bat assembleRelease
+
+产物：app/build/outputs/apk/release/app-release.apk
+发布：复制并重命名到 安装包/Bili23-Android-vX.Y.Z.apk
+     旧版本归档到 安装包/旧版本/
+
+签名：keystore/bili23-release.jks
+     storePassword / keyPassword = bili23123
+     keyAlias = bili23
+注意：签名不一致无法覆盖安装，测试时先卸载旧包。
+
+本地工具链（勿删除）：
+- android-sdk/       Android SDK（含 platform-tools/adb.exe）
+- gradle-dist/       Gradle 发行版
+- 依赖网络受限时自动走镜像（PyPI 同理）
+
+--------------------------------------------------------
+七、历次改动记录
+--------------------------------------------------------
+v1.0.0（2026-08-30）
+  - 搜索/详情/在线播放/下载（视频+音频）/本地播放
+  - 二维码 + Cookie 登录、我的收藏（B 站账号）
+  - 下载目录可改、下载历史清空、下载按钮提示
+
+v1.1.0（2026-08-30）
+  - 软件改名 Bili；深色模式即时生效 + 状态栏图标修复
+  - 侧边栏导航；音频封面（下载来源合成）
+  - 音频：播放列表/四种播放模式/拖拽 seek/上一首下一首/自动切歌
+  - 歌词：自动匹配 + 滚动高亮 + 点击跳转 + 缓存
+  - 视频：本地视频模块、全屏、横屏自动全屏、拖拽 seek、
+    队列顺序/循环/随机播放
+  - 播放列表：可新建/重命名/删除的命名列表，收藏同步到“我的收藏”
+  - 音频/视频多选批量删除；加入播放列表入口
+
+v1.1.0 修复与增强（2026-08-30 第二轮）
+  - 修复进度条拖拽无反应：Slider 必须显式给 valueRange（默认 0..1，
+    否则拖拽值映射到 0~1 毫秒，seek 永远到 0）；音频+视频均已修
+  - 音频页新增播放列表筛选：选中列表只显示该列表音频，
+    “全部音频”切换显示全部
+  - 修复切歌后封面/歌词不同步：MusicPlaybackService 新增
+    currentPath 静态字段，UI 轮询检测切歌并同步当前曲目、
+    触发歌词自动匹配；轮询间隔降到 300ms
+  - 歌词本地保留 + 支持编辑（歌词区右上角编辑按钮，改 LRC 保存生效）
+  - 视频上一集/下一集按钮始终显示；单视频播放时以“全部本地视频”
+    作为隐式队列，可顺序切换
+  - 视频全屏/横屏强制横屏：进入全屏时设置
+    SCREEN_ORIENTATION_SENSOR_LANDSCAPE（自动旋转关闭也能横屏），
+    退出恢复
+
+v1.1.0 修复与增强（2026-08-30 第三轮）
+  - 视频全屏自动隐藏控制条：全屏播放 3 秒后隐藏进度条/按钮，
+    点击画面显示/隐藏
+  - 视频/音频收藏夹独立：分别归入默认列表“我收藏的视频”与
+    “我收藏的音频”（按文件扩展名路由，旧数据自动迁移）；
+    移除“本地收藏”页面
+  - 底部导航栏加入“视频”标签（6 个：首页/搜索/视频/下载/音频/设置）
+  - 视频下载画质选项去重（QUALITY_OPTIONS 按显示名去重，去掉重复
+    的 720P/4K），详情页与设置页共用
+  - 歌词保存为 .lrc 文件（原词）+ .lrc.tl（翻译），可直接外部修改
+  - 日语/外文歌词翻译：网易云 tlyric 双语显示（原文+翻译逐行），
+    编辑对话框可分别修改原词与翻译
+  - 封面与歌曲按标签重命名：编辑标签保存后，文件/封面/歌词自动
+    重命名为“歌名-歌手”（renameAudioByTag，并同步播放列表路径）
+
+v1.1.0 修复与增强（2026-08-30 第四轮）
+  - 搜索翻页修复：hasMore 用 numPages 兜底判断；移除不可靠的滚动
+    自动加载，改为底部显式“下一页”按钮
+  - 修复“点击首页我的收藏跳到音频”：播放标记 localAudioToPlay 消费
+    后即清除；首页“我的收藏”改跳“播放列表”（收藏现按类型存放）
+  - 歌词动画：当前歌词行随播放放大+高亮平滑过渡（animateFloatAsState）
+  - 进度更流畅：音频轮询降到 250ms；服务同步线程异常不再中断
+  - 进度条美化：细条 + 主题色（Slider 高度 24dp，去默认大滑块感）
+  - 视频播放器：移除“队列播放”文字，下方展示全部已下载视频列表，
+    点击即切换播放；全屏改为 RESIZE_MODE_ZOOM 铺满（适配 1.5K/2K
+    不同分辨率，无黑边）
+  - 构建稳定性：gradle.properties 设 kotlin.compiler.execution.strategy
+    =in-process，避免 Kotlin 守护进程临时文件被沙箱拦截导致编译失败
+
+--------------------------------------------------------
+八、常见修改点速查
+--------------------------------------------------------
+- 加一个底部标签页：MainActivity.bottomItems + AppRoot 路由
+- 加一个侧边栏入口：AppDrawer() 里加 DrawerItem
+- 新增页面：screens/ 新建 Composable，MainActivity 注册路由
+- 改下载逻辑：data/DownloadManager.kt
+- 改 B 站接口：data/BiliApi.kt
+- 改音频播放行为：service/MusicPlaybackService.kt
+- 改视频播放行为：ui/screens/VideoPlayerScreen.kt
+- 改主题/状态栏：ui/Theme.kt + data/Settings.kt
+- 版本号：app/build.gradle.kts 的 versionCode/versionName
+- 应用名：res/values/strings.xml
+
+提示：播放列表名、文件名等含中文的导航参数需 URL 编码
+（PlaylistsScreen 用 URLEncoder/URLDecoder 处理）。
