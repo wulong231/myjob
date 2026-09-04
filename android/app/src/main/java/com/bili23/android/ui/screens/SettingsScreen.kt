@@ -1,5 +1,6 @@
 package com.bili23.android.ui.screens
 
+import com.bili23.android.BuildConfig
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -93,7 +94,7 @@ fun SettingsScreen(vm: AppViewModel = viewModel(), navController: NavHostControl
 
         Spacer(Modifier.height(24.dp))
         Text(
-            text = "Bili v1.1.0 · Android 版",
+            text = "Bili v${BuildConfig.VERSION_NAME} · Android 版",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

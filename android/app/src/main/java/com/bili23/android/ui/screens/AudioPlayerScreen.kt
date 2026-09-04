@@ -34,6 +34,8 @@ import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
@@ -189,11 +191,16 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
     val artists = remember(audioFiles) {
         audioFiles.map { it.artist }.filter { it.isNotBlank() }.distinct().sorted()
     }
+    // 搜索框：按歌手/歌名模糊筛选
+    var searchKeyword by remember { mutableStateOf("") }
 
-    // 当前展示的音频列表：按播放列表 + 歌手双重筛选
+    // 当前展示的音频列表：按播放列表 + 歌手 + 搜索词三重筛选
     val displayAudio = audioFiles.filter { item ->
         (selectedPlaylist == null || Settings.isInPlaylist(Settings.PLAYLIST_AUDIO, selectedPlaylist!!, item.path)) &&
-            (selectedArtist == null || item.artist == selectedArtist)
+            (selectedArtist == null || item.artist == selectedArtist) &&
+            (searchKeyword.isBlank() ||
+                item.artist.contains(searchKeyword, ignoreCase = true) ||
+                item.displayTitle.contains(searchKeyword, ignoreCase = true))
     }
 
     // 多选模式
@@ -347,6 +354,26 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             }
         }
 
+        // 搜索框：按歌手/歌名定位歌曲
+        OutlinedTextField(
+            value = searchKeyword,
+            onValueChange = { searchKeyword = it },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            placeholder = { Text("搜索歌手 / 歌名") },
+            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+            trailingIcon = {
+                if (searchKeyword.isNotEmpty()) {
+                    IconButton(onClick = { searchKeyword = "" }) {
+                        Icon(Icons.Filled.Close, contentDescription = "清空")
+                    }
+                }
+            },
+            singleLine = true,
+            shape = RoundedCornerShape(24.dp)
+        )
+
         // 播放列表筛选：全部音频 / 各命名列表
         LazyRow(
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
@@ -369,27 +396,25 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             }
         }
 
-        // 歌手分类筛选：按歌手定位对应歌曲
-        if (artists.isNotEmpty()) {
-            LazyRow(
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                item {
-                    FilterChip(
-                        selected = selectedArtist == null,
-                        onClick = { selectedArtist = null },
-                        label = { Text("全部歌手") }
-                    )
-                }
-                items(artists, key = { it }) { artist ->
-                    FilterChip(
-                        selected = selectedArtist == artist,
-                        onClick = { selectedArtist = artist },
-                        label = { Text(artist) }
-                    )
-                }
+        // 歌手分类筛选：按歌手定位对应歌曲（始终显示入口，未设置歌手时只有“全部歌手”）
+        LazyRow(
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            item {
+                FilterChip(
+                    selected = selectedArtist == null,
+                    onClick = { selectedArtist = null },
+                    label = { Text("全部歌手") }
+                )
+            }
+            items(artists, key = { it }) { artist ->
+                FilterChip(
+                    selected = selectedArtist == artist,
+                    onClick = { selectedArtist = artist },
+                    label = { Text(artist) }
+                )
             }
         }
 
