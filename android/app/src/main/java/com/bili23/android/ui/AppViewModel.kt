@@ -279,6 +279,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return sortGroup(fresh) + sortGroup(edited)
     }
 
+    /** 歌曲双重查重：歌名（歌词标题）+ 歌手都相同视为重复，返回已存在的重复歌曲（无则 null）。
+     *  歌名取分P名（part），单P时取视频标题；歌手取本地已编辑的歌手标签。 */
+    fun findDuplicateAudio(title: String, part: String, artist: String = ""): AudioItem? {
+        val songName = if (part.isNotBlank() && part != title) part else title
+        val targetTitle = normalizeSongName(songName)
+        val targetArtist = normalizeArtistName(artist)
+        return _audioFiles.value.firstOrNull { item ->
+            normalizeSongName(item.title) == targetTitle &&
+                normalizeArtistName(item.artist) == targetArtist
+        }
+    }
+
+    private fun normalizeSongName(name: String): String =
+        guessSongTitle(name).trim().lowercase().replace(Regex("\\s+"), "")
+
+    private fun normalizeArtistName(name: String): String =
+        name.trim().lowercase().replace(Regex("\\s+"), "")
+
     /** 多选调整音频位置（上移/下移），持久化保存 */
     fun reorderAudio(paths: List<String>, up: Boolean) {
         val current = _audioFiles.value

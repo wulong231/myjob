@@ -340,9 +340,16 @@ fun VideoDetailScreen(
                                         android.widget.Toast.LENGTH_SHORT
                                     ).show()
                                     var ok = 0
+                                    var skipped = 0
                                     for (ep in eps) {
                                         val url = vm.fetchPlayUrl(info.bvid, ep.cid, selectedQuality)
                                         if (url.audioUrl.isNotEmpty()) {
+                                            // 双重查重：歌名 + 歌手都相同视为重复，跳过避免重复下载
+                                            val dup = vm.findDuplicateAudio(info.title, ep.part)
+                                            if (dup != null) {
+                                                skipped++
+                                                continue
+                                            }
                                             vm.downloadManager.downloadAudioOnly(
                                                 bvid = info.bvid,
                                                 title = info.title,
@@ -356,7 +363,8 @@ fun VideoDetailScreen(
                                     }
                                     android.widget.Toast.makeText(
                                         context,
-                                        if (ok == eps.size) "已开始下载 $ok 个音频，可在音频页播放"
+                                        if (skipped > 0) "已开始下载 $ok 个音频，跳过 $skipped 个重复歌曲"
+                                        else if (ok == eps.size) "已开始下载 $ok 个音频，可在音频页播放"
                                         else "成功 $ok/${eps.size} 个，其余失败",
                                         android.widget.Toast.LENGTH_SHORT
                                     ).show()

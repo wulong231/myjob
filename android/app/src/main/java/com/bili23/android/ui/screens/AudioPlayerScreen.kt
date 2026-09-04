@@ -287,7 +287,10 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
         lyricStatus = "正在自动匹配歌词..."
         lyrics = emptyList()
         translations = emptyList()
-        val results = vm.searchLyrics(item.displayTitle)
+        // 搜索关键词自动带上歌手，格式：歌名 歌手，提高匹配准确度
+        val keyword = if (item.artist.isNotBlank()) "${item.displayTitle} ${item.artist}"
+        else item.displayTitle
+        val results = vm.searchLyrics(keyword)
         val (lrc, tl) = if (results.isEmpty()) Pair("", "")
         else vm.fetchLyricWithTranslation(results.first().second)
         lyricLoading = false
@@ -775,9 +778,20 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             item = item,
             onDismiss = { editTagItem = null },
             onSave = { title, artist ->
-                vm.updateAudioTag(item.path, title, artist)
-                vm.renameAudioByTag(item.path, title, artist)
-                editTagItem = null
+                // 编辑后双重查重：歌名 + 歌手与已有歌曲相同则阻止保存，避免出现重复歌曲
+                val dup = vm.findDuplicateAudio(title, title, artist)
+                if (dup != null && dup.path != item.path) {
+                    android.widget.Toast.makeText(
+                        context,
+                        "《$title》已存在（歌手：${dup.artist.ifBlank { "未知" }}），已阻止重复保存",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                    editTagItem = null
+                } else {
+                    vm.updateAudioTag(item.path, title, artist)
+                    vm.renameAudioByTag(item.path, title, artist)
+                    editTagItem = null
+                }
             }
         )
     }
@@ -858,8 +872,12 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
 
     // 歌词搜索对话框
     if (showSearchDialog) {
+        // 手动搜索对话框初始关键词同样带上歌手：歌名 歌手
+        val dialogKeyword = current?.let { c ->
+            if (c.artist.isNotBlank()) "${c.displayTitle} ${c.artist}" else c.displayTitle
+        } ?: ""
         LyricsSearchDialog(
-            title = current?.displayTitle ?: "",
+            title = dialogKeyword,
             onDismiss = { showSearchDialog = false },
             onLyricsLoaded = { lrcText, tlText ->
                 lyrics = parseLrc(lrcText)
