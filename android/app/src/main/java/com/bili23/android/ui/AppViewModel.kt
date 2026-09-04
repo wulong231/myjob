@@ -44,7 +44,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val app = getApplication<Application>()
         downloadDir = File(app.getExternalFilesDir(null), safe).apply { mkdirs() }
         downloadManager = DownloadManager(BiliApi.buildClient(), downloadDir)
-        diskScanned = false
         scanAudioFiles()
         refreshHomeStats()
     }
@@ -377,53 +376,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // 去除前后冗余分隔符
         name = name.trim('_', '-', ' ', '.')
         return name.ifBlank { fileName }
-    }
-
-    /** 扫描磁盘上已下载的视频/音频文件（应用重启后恢复下载记录，每会话仅执行一次） */
-    private var diskScanned = false
-    fun scanDiskDownloads() {
-        // 每会话只扫描一次，避免“清空历史记录”后重新进入页面又被磁盘扫描加回来
-        if (diskScanned) return
-        diskScanned = true
-        viewModelScope.launch(Dispatchers.IO) {
-            // m4v 仅用于视频下载临时文件，不作为成品扫描，避免产生重复视频记录
-            val videoExt = setOf("mp4", "mkv", "webm")
-            val audioExt = setOf("mp3", "m4a", "flac", "wav", "aac", "ogg")
-            val recovered = mutableListOf<DownloadTask>()
-            // 正在下载的临时文件跳过，避免把 .m4v/.m4a 误当成品产生重复记录
-            val tempSet = downloadManager.activeTempFiles.value
-
-            fun walk(dir: File) {
-                val files = dir.listFiles() ?: return
-                for (f in files) {
-                    if (f.isDirectory) { walk(f); continue }
-                    if (f.absolutePath in tempSet) continue
-                    val ext = f.extension.lowercase()
-                    if (ext !in videoExt && ext !in audioExt) continue
-                    val type = if (ext in videoExt) DownloadTask.TYPE_VIDEO else DownloadTask.TYPE_AUDIO
-                    val name = f.name.substringBeforeLast('.')
-                    recovered.add(
-                        DownloadTask(
-                            id = "disk_${f.absolutePath.hashCode()}",
-                            title = name,
-                            bvid = "",
-                            cid = 0,
-                            part = "",
-                            quality = if (type == DownloadTask.TYPE_VIDEO) Settings.defaultQuality else 0,
-                            status = DownloadTask.STATUS_COMPLETED,
-                            filePath = f.absolutePath,
-                            type = type
-                        )
-                    )
-                }
-            }
-            walk(downloadDir)
-            // 与内存任务合并（磁盘任务仅当不在内存任务中才添加）
-            val current = downloadManager.tasks.value
-            val existing = current.map { it.filePath }.toSet()
-            val toAdd = recovered.filter { it.filePath !in existing }
-            downloadManager.addTasks(toAdd)
-        }
     }
 
     // ---- 本地视频文件（独立于下载记录，清空下载记录后仍保留）----

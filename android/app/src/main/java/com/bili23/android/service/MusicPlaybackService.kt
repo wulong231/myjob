@@ -17,6 +17,7 @@ import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import androidx.media.app.NotificationCompat.MediaStyle
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
@@ -195,6 +196,8 @@ class MusicPlaybackService : Service() {
         createChannel()
 
         player = ExoPlayer.Builder(this).build()
+        // 音频焦点：播放时请求焦点，其他 App 播放时自动暂停/降音，恢复后自动续播
+        player.setAudioAttributes(AudioAttributes.DEFAULT, true)
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 syncState()
@@ -537,7 +540,7 @@ class MusicPlaybackService : Service() {
             )
             .addAction(R.drawable.ic_next, "下一首", nextPi)
             .addAction(R.drawable.ic_timer, timerLabel, timerPi)
-            .addAction(R.drawable.ic_stop, "停止", stopPi)
+            .addAction(R.drawable.ic_close, "关闭", stopPi)
             .setStyle(
                 MediaStyle()
                     .setMediaSession(mediaSession.sessionToken)

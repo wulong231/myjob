@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
@@ -360,6 +361,8 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
             val f = File(localPath!!)
             if (f.exists()) {
                 val newPlayer = ExoPlayer.Builder(context).build()
+                // 音频焦点：避免与其他 App 的音乐播放冲突（被抢占时暂停/降音，恢复后续播）
+                newPlayer.setAudioAttributes(AudioAttributes.DEFAULT, true)
                 newPlayer.addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         syncPlayerState()
@@ -884,6 +887,8 @@ private fun buildBiliPlayer(context: android.content.Context, play: PlayUrl): Ex
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory)
         )
         .build()
+    // 音频焦点：避免与其他 App 的音乐播放冲突（被抢占时暂停/降音，恢复后续播）
+    player.setAudioAttributes(AudioAttributes.DEFAULT, true)
 
     val videoItem = MediaItem.Builder()
         .setUri(Uri.parse(play.videoUrl))

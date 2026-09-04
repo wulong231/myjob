@@ -57,7 +57,6 @@ fun DownloadsScreen(navController: NavHostController, vm: AppViewModel = viewMod
     var showClearDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        vm.scanDiskDownloads()
         vm.scanAudioFiles()
     }
 

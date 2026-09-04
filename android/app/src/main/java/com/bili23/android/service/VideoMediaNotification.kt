@@ -168,7 +168,7 @@ object VideoMediaNotification {
             .addAction(playPauseIcon, playPauseLabel, pi(VideoMediaController.ACTION_PLAY_PAUSE, 2))
             .addAction(R.drawable.ic_next, "下一集", pi(VideoMediaController.ACTION_NEXT, 3))
             .addAction(R.drawable.ic_timer, timerText, pi(VideoMediaController.ACTION_TIMER, 4))
-            .addAction(R.drawable.ic_stop, "停止", pi(VideoMediaController.ACTION_STOP, 5))
+            .addAction(R.drawable.ic_close, "关闭", pi(VideoMediaController.ACTION_STOP, 5))
             .setStyle(
                 MediaStyle().setShowActionsInCompactView(0, 1, 2)
             )

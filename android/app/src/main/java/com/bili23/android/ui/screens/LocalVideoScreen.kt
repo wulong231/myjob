@@ -91,7 +91,6 @@ fun LocalVideoScreen(navController: NavHostController, vm: AppViewModel = viewMo
     val playlists = remember(playlistTick) { Settings.getPlaylists(Settings.PLAYLIST_VIDEO) }
 
     LaunchedEffect(Unit) {
-        vm.scanDiskDownloads()
         vm.scanLocalVideos()
     }
 

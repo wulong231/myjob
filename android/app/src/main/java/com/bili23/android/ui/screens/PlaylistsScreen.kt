@@ -263,7 +263,6 @@ fun PlaylistDetailScreen(
 
     LaunchedEffect(Unit) {
         vm.scanAudioFiles()
-        vm.scanDiskDownloads()
     }
 
     // 分类：仅保留磁盘上仍存在的文件
