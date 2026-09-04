@@ -249,7 +249,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             val files = downloadDir.walkTopDown()
                 .filter { it.isFile && it.extension.lowercase() in setOf("mp3", "m4a", "flac", "wav", "aac", "ogg") }
-                .sortedBy { it.name.lowercase() }
                 .map {
                     val tag = Settings.getAudioTag(it.absolutePath)
                     val title = if (tag.first.isNotEmpty()) tag.first
@@ -263,11 +262,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
                 .toList()
-            // 应用多选调整过的自定义顺序
-            _audioFiles.value = Settings.reorderByCustom(
-                files, Settings.getCustomOrder(Settings.PLAYLIST_AUDIO)
-            ) { it.path }
+            _audioFiles.value = sortAudioList(files)
         }
+    }
+
+    /** 音频排序：未编辑歌名/歌手的新歌排前端，已编辑（改过歌名/歌手）的排后面；同组内应用自定义顺序 */
+    private fun sortAudioList(files: List<AudioItem>): List<AudioItem> {
+        val order = Settings.getCustomOrder(Settings.PLAYLIST_AUDIO)
+        val edited = files.filter {
+            val (t, a) = Settings.getAudioTag(it.path)
+            t.isNotEmpty() || a.isNotEmpty()
+        }
+        val fresh = files.filter { it !in edited }
+        fun sortGroup(list: List<AudioItem>): List<AudioItem> =
+            if (order.isEmpty()) list else Settings.reorderByCustom(list, order) { it.path }
+        return sortGroup(fresh) + sortGroup(edited)
     }
 
     /** 多选调整音频位置（上移/下移），持久化保存 */

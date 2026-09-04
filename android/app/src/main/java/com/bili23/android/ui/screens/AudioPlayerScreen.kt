@@ -184,10 +184,17 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
     var selectedPlaylist by remember { mutableStateOf<String?>(null) }
     var playlistTick by remember { mutableStateOf(0) }
     val playlists = remember(playlistTick) { Settings.getPlaylists(Settings.PLAYLIST_AUDIO) }
+    // 歌手分类筛选（null = 全部歌手）
+    var selectedArtist by remember { mutableStateOf<String?>(null) }
+    val artists = remember(audioFiles) {
+        audioFiles.map { it.artist }.filter { it.isNotBlank() }.distinct().sorted()
+    }
 
-    // 当前展示的音频列表：选中列表时只显示该列表内音乐
-    val displayAudio = if (selectedPlaylist == null) audioFiles
-    else audioFiles.filter { Settings.isInPlaylist(Settings.PLAYLIST_AUDIO, selectedPlaylist!!, it.path) }
+    // 当前展示的音频列表：按播放列表 + 歌手双重筛选
+    val displayAudio = audioFiles.filter { item ->
+        (selectedPlaylist == null || Settings.isInPlaylist(Settings.PLAYLIST_AUDIO, selectedPlaylist!!, item.path)) &&
+            (selectedArtist == null || item.artist == selectedArtist)
+    }
 
     // 多选模式
     var selectionMode by remember { mutableStateOf(false) }
@@ -359,6 +366,30 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                     onClick = { selectedPlaylist = name },
                     label = { Text(name) }
                 )
+            }
+        }
+
+        // 歌手分类筛选：按歌手定位对应歌曲
+        if (artists.isNotEmpty()) {
+            LazyRow(
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                item {
+                    FilterChip(
+                        selected = selectedArtist == null,
+                        onClick = { selectedArtist = null },
+                        label = { Text("全部歌手") }
+                    )
+                }
+                items(artists, key = { it }) { artist ->
+                    FilterChip(
+                        selected = selectedArtist == artist,
+                        onClick = { selectedArtist = artist },
+                        label = { Text(artist) }
+                    )
+                }
             }
         }
 
