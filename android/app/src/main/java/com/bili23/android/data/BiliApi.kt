@@ -496,10 +496,16 @@ class BiliApi(private val okHttp: OkHttpClient) {
                         )
                     )
                 }
+                // 服务端 has_more 可能是布尔或 0/1，optInt 对布尔值恒返回 0，
+                // 因此优先用总数精确判断是否还有下一页，拿不到总数再回退 optBoolean
+                val total = data.optJSONObject("page")?.optInt("total")
+                    ?: data.optJSONObject("info")?.optInt("media_count")
+                    ?: 0
+                val hasMore = if (total > 0) page * 20 < total else data.optBoolean("has_more")
                 FavoriteVideoPage(
                     videos = videos,
                     page = page,
-                    hasMore = data.optInt("has_more") == 1
+                    hasMore = hasMore
                 )
             } catch (_: Exception) {
                 FavoriteVideoPage()
