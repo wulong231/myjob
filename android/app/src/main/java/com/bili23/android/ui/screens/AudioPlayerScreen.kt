@@ -35,6 +35,8 @@ import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Repeat
@@ -193,6 +195,8 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
     }
     // 搜索框：按歌手/歌名模糊筛选
     var searchKeyword by remember { mutableStateOf("") }
+    // 分类（播放列表 + 歌手）收纳开关
+    var filtersExpanded by remember { mutableStateOf(false) }
 
     // 当前展示的音频列表：按播放列表 + 歌手 + 搜索词三重筛选
     val displayAudio = audioFiles.filter { item ->
@@ -374,7 +378,36 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             shape = RoundedCornerShape(24.dp)
         )
 
-        // 播放列表筛选：全部音频 / 各命名列表
+        // 分类收纳按钮：展开/收起播放列表与歌手分类
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { filtersExpanded = !filtersExpanded }
+                .padding(horizontal = 16.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "分类",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.width(2.dp))
+            Icon(
+                if (filtersExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = if (filtersExpanded) "收起分类" else "展开播放列表 / 歌手分类",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        // 播放列表筛选：全部音频 / 各命名列表（收纳区域）
+        if (filtersExpanded) {
         LazyRow(
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -417,6 +450,7 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                 )
             }
         }
+        } // 收纳区域结束
 
         // 多选工具栏（小字体，保证一行放得下）
         if (selectionMode) {
