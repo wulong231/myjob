@@ -34,6 +34,7 @@ from qfluentwidgets import (
 )
 
 from ..config import get_config
+from ..bilibili_api import BilibiliClient
 from .equalizer_dialog import EqualizerDialog
 from .desktop_lyrics import DesktopLyrics
 from .lyrics_widget import LyricsWidget
@@ -2538,7 +2539,7 @@ class AudioPlayerPage(QWidget):
                 InfoBar.error("保存失败", str(e), duration=3000, parent=self)
 
     def _search_lyrics_online(self):
-        """在线搜索歌词（通过网易云 API）。
+        """在线搜索歌词（从 B 站 CC 字幕获取原文与翻译 LRC）。
         支持按歌名（标签中的 title）或按文件名两种方式搜索，用户可自选其一。"""
         if self._current_index < 0:
             InfoBar.warning("未播放", "请先选择一首歌曲", duration=2000, parent=self)
@@ -2552,7 +2553,6 @@ class AudioPlayerPage(QWidget):
 
         # 让用户选择搜索关键词来源
         if title and title != audio_name:
-            from PySide6.QtWidgets import QInputDialog
             choices = [f"按歌名搜索：{title}", f"按文件名搜索：{audio_name}"]
             choice, ok = QInputDialog.getItem(
                 self, "搜索歌词", "请选择搜索关键词：", choices, 0, False
@@ -2563,15 +2563,156 @@ class AudioPlayerPage(QWidget):
         else:
             search_key = title or audio_name
 
-        InfoBar.info("搜索中", f"正在搜索「{search_key}」的歌词...",
+        InfoBar.info("搜索中", f"正在搜索「{search_key}」的 B 站视频...",
                      duration=3000, parent=self)
 
-        # 在后台线程搜索
-        from PySide6.QtCore import QThread, Signal as QSignal
-
+        # 第一步：后台线程用 B 站搜索接口查找视频（CC 字幕通常含歌词）
         class LyricsSearchWorker(QThread):
-            found = QSignal(str, str)  # (lyrics_text, source)
-            failed = QSignal(str)       # error_message
+            candidates = Signal(list)   # [(bvid, title, author), ...]
+            failed = Signal(str)        # error_message
+
+            def __init__(self, keyword):
+                super().__init__()
+                self._keyword = keyword
+
+            def run(self):
+                try:
+                    client = BilibiliClient()
+                    result = client.search(self._keyword, page=1)
+                    videos = result.videos if result else []
+                    cands = [
+                        (v.bvid, v.title,
+                         getattr(v, 'owner_name', '') or getattr(v, 'owner', ''))
+                        for v in videos[:10]
+                    ]
+                    if not cands:
+                        self.failed.emit("未找到相关视频")
+                        return
+                    self.candidates.emit(cands)
+                except Exception as e:
+                    self.failed.emit(str(e))
+
+        worker = LyricsSearchWorker(search_key)
+        self._lyrics_search_worker = worker  # 防止被 GC
+
+        def on_candidates(cands):
+            labels = [f"{t}  |  {a}" for _, t, a in cands]
+            choice, ok = QInputDialog.getItem(
+                self, "选择视频", "请选择含歌词的视频（取自 B 站 CC 字幕）：",
+                labels, 0, False
+            )
+            if not ok:
+                InfoBar.info("已取消", "未获取歌词", duration=2000, parent=self)
+                return
+            idx = labels.index(choice)
+            # 用户选的排最前，其余候选按顺序兜底（自动换到有字幕的视频）
+            ordered = [cands[idx][0]] + [c[0] for c in cands if c[0] != cands[idx][0]]
+            self._fetch_subtitle_lyrics(ordered, audio_path, audio_name, search_key, artist)
+
+        def on_failed(err):
+            InfoBar.warning("搜索失败", err, duration=3000, parent=self)
+
+        worker.candidates.connect(on_candidates)
+        worker.failed.connect(on_failed)
+        worker.start()
+
+    def _fetch_subtitle_lyrics(self, bvids, audio_path, audio_name, search_key, artist):
+        """第二步：按顺序尝试候选视频的 CC 字幕，转换为原文 .lrc 与翻译 .zh.lrc 并保存。
+        若全部视频都没有 CC 字幕，则回退到网易云搜索歌词。"""
+        InfoBar.info("获取中", "正在提取 B 站字幕歌词...", duration=3000, parent=self)
+
+        class SubtitleWorker(QThread):
+            found = Signal(str, str, str)  # (original_lrc, translation_lrc, source)
+            failed = Signal(str)
+
+            def __init__(self, bvids):
+                super().__init__()
+                self._bvids = bvids
+
+            def run(self):
+                client = BilibiliClient()
+                last_err = "候选视频均无 CC 字幕，无法提取歌词"
+                for bvid in self._bvids:
+                    try:
+                        info = client.get_video_info(bvid)
+                        if not info or not info.episodes:
+                            continue
+                        cid = info.episodes[0].cid
+                        subs = client.get_subtitles(bvid, cid)
+                        if not subs:
+                            continue
+
+                        # 原文：优先不含“翻译”且为中文的字幕；翻译：含“翻译”或与原文不同语言
+                        non_trans = [s for s in subs if '翻译' not in s.get('lan_doc', '')]
+                        trans = [s for s in subs if '翻译' in s.get('lan_doc', '')]
+                        original = None
+                        if non_trans:
+                            original = next(
+                                (s for s in non_trans if s.get('lan', '').lower().startswith('zh')),
+                                non_trans[0],
+                            )
+                        translation = trans[0] if trans else None
+                        if not translation and original:
+                            other = [
+                                s for s in subs
+                                if s.get('lan', '') != original.get('lan', '') and s is not original
+                            ]
+                            if other:
+                                translation = other[0]
+
+                        orig_lrc = client.get_subtitle_lrc(original['subtitle_url']) if original else ""
+                        trans_lrc = client.get_subtitle_lrc(translation['subtitle_url']) if translation else ""
+                        if orig_lrc or trans_lrc:
+                            source = f"B站 - {info.title}"
+                            self.found.emit(orig_lrc, trans_lrc, source)
+                            return
+                    except Exception as e:
+                        last_err = str(e)
+                self.failed.emit(last_err)
+
+        worker = SubtitleWorker(bvids)
+        self._lyrics_subtitle_worker = worker  # 防止被 GC
+
+        def on_found(orig_lrc, trans_lrc, source):
+            try:
+                default_path = os.path.join(os.path.dirname(audio_path), f"{audio_name}.lrc")
+                existing = _find_lrc_for_audio(audio_path) or default_path
+                saved = []
+                if orig_lrc:
+                    with open(existing, 'w', encoding='utf-8') as f:
+                        f.write(orig_lrc)
+                    self._lyrics_data = _parse_lrc(existing)
+                    saved.append(os.path.basename(existing))
+                translated = []
+                if trans_lrc:
+                    trans_path = existing.replace('.lrc', '.zh.lrc').replace('.LRC', '.zh.lrc')
+                    with open(trans_path, 'w', encoding='utf-8') as f:
+                        f.write(trans_lrc)
+                    saved.append(os.path.basename(trans_path))
+                    translated = self._load_cached_translation(existing)
+                self.lyrics_widget.set_lyrics(self._lyrics_data, translated)
+                InfoBar.success("歌词已获取",
+                                f"来源: {source} | 已保存 {'、'.join(saved)}",
+                                duration=4000, parent=self)
+            except Exception as e:
+                InfoBar.error("保存歌词失败", str(e), duration=3000, parent=self)
+
+        def on_failed(err):
+            InfoBar.warning("B站无可用字幕", err, duration=2500, parent=self)
+            self._search_netease_fallback(search_key, artist, audio_path, audio_name)
+
+        worker.found.connect(on_found)
+        worker.failed.connect(on_failed)
+        worker.start()
+
+    def _search_netease_fallback(self, search_key, artist, audio_path, audio_name):
+        """网易云兜底搜索歌词（B 站候选视频均无 CC 字幕时调用）。"""
+        InfoBar.info("回退搜索", f"B站无字幕，正在用网易云搜索「{search_key}」...",
+                     duration=3000, parent=self)
+
+        class NeteaseLyricsWorker(QThread):
+            found = Signal(str, str)  # (lyrics_text, source)
+            failed = Signal(str)       # error_message
 
             def __init__(self, keyword, artist):
                 super().__init__()
@@ -2582,7 +2723,6 @@ class AudioPlayerPage(QWidget):
                 try:
                     import httpx
                     client = httpx.Client(timeout=10)
-                    # 网易云音乐搜索 API
                     search_url = "https://music.163.com/api/search/get/web"
                     resp = client.post(search_url, data={
                         "s": f"{self._keyword} {self._artist}".strip(),
@@ -2596,15 +2736,14 @@ class AudioPlayerPage(QWidget):
                     if not songs:
                         self.failed.emit("未找到匹配的歌曲")
                         return
-
                     song_id = songs[0]["id"]
-                    # 获取歌词
                     lrc_url = f"https://music.163.com/api/song/lyric?id={song_id}&lv=1&kv=1&tv=-1"
                     lrc_resp = client.get(lrc_url, headers={"Referer": "https://music.163.com"})
                     lrc_data = lrc_resp.json()
                     lrc_text = lrc_data.get("lrc", {}).get("lyric", "")
                     if lrc_text:
-                        source = f"网易云 - {songs[0].get('name', '')} ({songs[0].get('artists', [{}])[0].get('name', '')})"
+                        source = (f"网易云 - {songs[0].get('name', '')} "
+                                  f"({songs[0].get('artists', [{}])[0].get('name', '')})")
                         self.found.emit(lrc_text, source)
                     else:
                         self.failed.emit("该歌曲暂无歌词")
@@ -2612,14 +2751,13 @@ class AudioPlayerPage(QWidget):
                 except Exception as e:
                     self.failed.emit(str(e))
 
-        worker = LyricsSearchWorker(search_key, artist)
-        self._lyrics_search_worker = worker  # 防止被 GC
+        worker = NeteaseLyricsWorker(search_key, artist)
+        self._lyrics_netease_worker = worker  # 防止被 GC
 
         def on_found(lrc_text, source):
-            # 弹出编辑器让用户预览并修改搜索到的歌词，确认后再保存
+            # 弹出编辑器让用户预览并修改，确认后再保存（沿用原网易云交互）
             audio_name_ext = os.path.splitext(os.path.basename(audio_path))[0]
             default_save_path = os.path.join(os.path.dirname(audio_path), f"{audio_name_ext}.lrc")
-            # 已存在 .lrc 则复用其路径，否则使用默认路径
             existing_lrc = _find_lrc_for_audio(audio_path) or default_save_path
             try:
                 dialog = LyricsEditorDialog(
@@ -2629,7 +2767,6 @@ class AudioPlayerPage(QWidget):
                     parent=self,
                 )
             except Exception as e:
-                # 对话框创建失败（极端情况）：直接保存原始搜索结果
                 logger.warning(f"创建歌词编辑器失败，直接保存: {e}")
                 try:
                     with open(default_save_path, 'w', encoding='utf-8') as f:
@@ -2642,22 +2779,17 @@ class AudioPlayerPage(QWidget):
                 except Exception as e2:
                     InfoBar.error("保存歌词失败", str(e2), duration=3000, parent=self)
                 return
-
             try:
                 if not dialog.exec():
-                    # 用户取消，不保存
                     InfoBar.info("已取消", "歌词未保存", duration=2000, parent=self)
                     return
             except Exception as e:
                 logger.warning(f"歌词编辑器执行异常: {e}")
-                # 异常也视为取消
                 return
-
-            # 用户确认保存：获取编辑后的文本和保存路径
             try:
                 edited_text = dialog.get_lyrics_text()
             except Exception:
-                edited_text = lrc_text  # 兜底用原始搜索文本
+                edited_text = lrc_text
             try:
                 save_path = dialog.get_save_path()
             except Exception:

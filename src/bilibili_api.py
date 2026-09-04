@@ -483,6 +483,59 @@ class BilibiliClient:
             logger.error(f"获取播放地址异常: {e}")
             return None
 
+    # ========== CC 字幕（用于提取歌词）==========
+
+    def get_subtitles(self, bvid: str, cid: int) -> Optional[List[Dict]]:
+        """获取视频 CC 字幕列表。
+        返回形如 [{lan, lan_doc, subtitle_url, ...}] 的字幕轨道列表；无字幕返回 None。"""
+        params = {"bvid": bvid, "cid": cid}
+        response = None
+        # 优先带 WBI 签名的播放器接口，失败回退旧版 v2
+        try:
+            signed = _wbi_signer.sign(dict(params))
+            response = api_get(f"{API_BASE}/x/player/wbi/v2", params=signed)
+        except Exception as e:
+            logger.warning(f"获取字幕(wbi/v2)失败，回退 v2: {e}")
+        if not response or response.get("code") != 0:
+            try:
+                response = api_get(f"{API_BASE}/x/player/v2", params=params)
+            except Exception as e:
+                logger.error(f"获取字幕失败: {e}")
+                return None
+        if response.get("code") != 0:
+            logger.warning(f"获取字幕失败: {response.get('message')}")
+            return None
+        subs = response.get("data", {}).get("subtitle", {}).get("subtitles", [])
+        return subs or None
+
+    def get_subtitle_lrc(self, subtitle_url: str) -> str:
+        """下载 B 站 CC 字幕 JSON 并转换为 LRC 文本。
+        字幕 body 为 [{from, to, content, location}]，时间戳按秒取整到百分秒。"""
+        if not subtitle_url:
+            return ""
+        if subtitle_url.startswith("//"):
+            subtitle_url = "https:" + subtitle_url
+        try:
+            data = api_get(subtitle_url)
+            body = data.get("body", [])
+            lines = []
+            for item in body:
+                t = item.get("from", 0)
+                content = item.get("content", "")
+                if not content:
+                    continue
+                content = content.replace("\r", "")
+                minutes = int(t // 60)
+                seconds = int(t % 60)
+                centis = int(round((t - int(t)) * 100))
+                if centis >= 100:
+                    centis = 99
+                lines.append(f"[{minutes:02d}:{seconds:02d}.{centis:02d}]{content}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"下载字幕转 LRC 失败: {e}")
+            return ""
+
     # ========== 用户信息 ==========
 
     def get_user_info(self) -> Optional[UserInfo]:
