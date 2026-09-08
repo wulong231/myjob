@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
@@ -748,16 +749,17 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                                     color = if (isCurrent) MaterialTheme.colorScheme.primary
                                     else MaterialTheme.colorScheme.onSurface
                                 )
-                                if (item.path !in favPaths) {
+                                // 未加入任何自建播放列表的歌曲用小红点标记，便于整理
+                                val inUserPlaylist = playlists.entries.any { (name, paths) ->
+                                    name != Settings.DEFAULT_AUDIO_FAVORITES && item.path in paths
+                                }
+                                if (!inUserPlaylist) {
                                     Spacer(Modifier.width(6.dp))
-                                    Text(
-                                        text = "未收藏",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.error,
+                                    Box(
                                         modifier = Modifier
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f))
-                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(MaterialTheme.colorScheme.error)
                                     )
                                 }
                             }
