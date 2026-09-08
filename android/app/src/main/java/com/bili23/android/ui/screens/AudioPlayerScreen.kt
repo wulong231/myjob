@@ -34,10 +34,12 @@ import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
@@ -197,14 +199,20 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
     var searchKeyword by remember { mutableStateOf("") }
     // 分类（播放列表 + 歌手）收纳开关
     var filtersExpanded by remember { mutableStateOf(false) }
+    // 排序方式：0=默认（新歌优先） 1=按字母 A-Z
+    var sortMode by remember { mutableStateOf(0) }
+    var showSortDialog by remember { mutableStateOf(false) }
 
-    // 当前展示的音频列表：按播放列表 + 歌手 + 搜索词三重筛选
-    val displayAudio = audioFiles.filter { item ->
-        (selectedPlaylist == null || Settings.isInPlaylist(Settings.PLAYLIST_AUDIO, selectedPlaylist!!, item.path)) &&
-            (selectedArtist == null || item.artist == selectedArtist) &&
-            (searchKeyword.isBlank() ||
-                item.artist.contains(searchKeyword, ignoreCase = true) ||
-                item.displayTitle.contains(searchKeyword, ignoreCase = true))
+    // 当前展示的音频列表：按播放列表 + 歌手 + 搜索词三重筛选，再按排序方式排列
+    val displayAudio = run {
+        val base = audioFiles.filter { item ->
+            (selectedPlaylist == null || Settings.isInPlaylist(Settings.PLAYLIST_AUDIO, selectedPlaylist!!, item.path)) &&
+                (selectedArtist == null || item.artist == selectedArtist) &&
+                (searchKeyword.isBlank() ||
+                    item.artist.contains(searchKeyword, ignoreCase = true) ||
+                    item.displayTitle.contains(searchKeyword, ignoreCase = true))
+        }
+        if (sortMode == 1) base.sortedBy { it.displayTitle.lowercase() } else base
     }
 
     // 多选模式
@@ -381,32 +389,53 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             shape = RoundedCornerShape(24.dp)
         )
 
-        // 分类收纳按钮：展开/收起播放列表与歌手分类
+        // 分类收纳按钮（展开/收起） + 排序方式
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { filtersExpanded = !filtersExpanded }
-                .padding(horizontal = 16.dp, vertical = 2.dp),
+                .padding(horizontal = 8.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { filtersExpanded = !filtersExpanded }
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "分类",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(2.dp))
+                Icon(
+                    if (filtersExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (filtersExpanded) "收起分类" else "展开播放列表 / 歌手分类",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.weight(1f))
             Text(
-                text = "分类",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.width(2.dp))
-            Icon(
-                if (filtersExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = if (filtersExpanded) "收起分类" else "展开播放列表 / 歌手分类",
+                text = if (sortMode == 1) "按字母" else "默认",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            IconButton(onClick = { showSortDialog = true }) {
+                Icon(
+                    Icons.Filled.Sort,
+                    contentDescription = "排序方式",
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
         }
 
         // 播放列表筛选：全部音频 / 各命名列表（收纳区域）
@@ -709,15 +738,29 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                         }
                         Spacer(Modifier.size(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            // 只显示歌名
-                            Text(
-                                text = item.displayTitle,
-                                style = MaterialTheme.typography.bodyMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                color = if (isCurrent) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onSurface
-                            )
+                            // 只显示歌名；未加入收藏夹的歌曲打上标记便于整理
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = item.displayTitle,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    color = if (isCurrent) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.onSurface
+                                )
+                                if (item.path !in favPaths) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = "未收藏",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f))
+                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                    )
+                                }
+                            }
                             if (item.artist.isNotBlank()) {
                                 Text(
                                     text = item.artist,
@@ -792,6 +835,52 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                     vm.renameAudioByTag(item.path, title, artist)
                     editTagItem = null
                 }
+            }
+        )
+    }
+
+    // 排序方式对话框
+    if (showSortDialog) {
+        AlertDialog(
+            onDismissRequest = { showSortDialog = false },
+            title = { Text("排序方式") },
+            text = {
+                Column {
+                    listOf(
+                        0 to "默认（新歌优先）",
+                        1 to "按字母 A-Z"
+                    ).forEach { (mode, label) ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    sortMode = mode
+                                    showSortDialog = false
+                                }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (sortMode == mode) {
+                                Icon(
+                                    Icons.Filled.Check,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showSortDialog = false }) { Text("取消") }
             }
         )
     }
