@@ -4,11 +4,16 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.BitmapFactory
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -101,6 +106,11 @@ class MusicPlaybackService : Service() {
         @Volatile
         var isPlaying: Boolean = false
             private set
+
+        /** 是否因耳机/蓝牙断开而自动暂停（耳机重新连接后自动续播） */
+        @Volatile
+        var pausedForHeadset: Boolean = false
+            private set
     }
 
     private data class Track(
@@ -121,6 +131,8 @@ class MusicPlaybackService : Service() {
     private var notifyTicks = 0
     /** 定时关闭剩余毫秒（0=关闭），循环切换 15/30/60 分钟 */
     private var timerMillis: Long = 0L
+    /** 耳机重新连接检测计数（约每 2 秒检查一次） */
+    private var headsetCheckTicks = 0
     private val progressSync = object : Runnable {
         override fun run() {
             try {
@@ -136,6 +148,13 @@ class MusicPlaybackService : Service() {
                     stopPlaybackAndSelf()
                 }
             }
+            // 耳机/蓝牙重新连接后自动续播（因断开而暂停时）
+            headsetCheckTicks++
+            if (pausedForHeadset && headsetCheckTicks % 5 == 0 && hasHeadsetDevice()) {
+                pausedForHeadset = false
+                player.play()
+                updateNotification()
+            }
             // 约每 2.4 秒刷新一次通知栏进度/时间（后台运行也能看到进度）
             notifyTicks++
             if (notifyTicks % 6 == 0) {
@@ -145,6 +164,32 @@ class MusicPlaybackService : Service() {
                 }
             }
             mainHandler.postDelayed(this, 400)
+        }
+    }
+
+    /** 耳机/蓝牙断开时自动暂停（ACTION_AUDIO_BECOMING_NOISY：有线耳机拔出、蓝牙断开都会触发） */
+    private val headsetReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY && player.isPlaying) {
+                player.pause()
+                pausedForHeadset = true
+                updateNotification()
+            }
+        }
+    }
+
+    /** 检测当前是否有耳机/蓝牙音频输出设备（用于判断是否恢复播放，getDevices 无需任何权限） */
+    private fun hasHeadsetDevice(): Boolean {
+        return try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+            }
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -175,6 +220,7 @@ class MusicPlaybackService : Service() {
         currentCover = ""
         currentPath = ""
         timerMillis = 0
+        pausedForHeadset = false
         syncState()
         serviceActive = false
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -225,6 +271,14 @@ class MusicPlaybackService : Service() {
 
         // 主线程周期同步进度到静态状态（ExoPlayer 只允许在主线程访问）
         mainHandler.post(progressSync)
+
+        // 注册耳机/蓝牙断开监听（系统受保护广播，无需任何权限）
+        val headsetFilter = IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(headsetReceiver, headsetFilter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(headsetReceiver, headsetFilter)
+        }
 
         mediaSession = MediaSessionCompat(this, "BiliMusic").apply {
             setCallback(object : MediaSessionCompat.Callback() {
@@ -569,6 +623,11 @@ class MusicPlaybackService : Service() {
     override fun onDestroy() {
         serviceActive = false
         mainHandler.removeCallbacks(progressSync)
+        try {
+            unregisterReceiver(headsetReceiver)
+        } catch (_: Exception) {
+        }
+        pausedForHeadset = false
         player.release()
         mediaSession.release()
         super.onDestroy()

@@ -1,5 +1,6 @@
 package com.bili23.android.ui.screens
 
+import androidx.activity.compose.BackHandler
 import android.content.res.Configuration
 import android.net.Uri
 import androidx.compose.foundation.background
@@ -448,6 +449,11 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
         manualFullscreen = false
         (context as? android.app.Activity)?.requestedOrientation =
             android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+    }
+
+    // 全屏/横屏时拦截系统返回手势（左划边缘返回）：先退回竖屏播放界面，而不是直接退出播放器
+    BackHandler(enabled = isFullscreen) {
+        exitFullscreen()
     }
 
     Scaffold(
