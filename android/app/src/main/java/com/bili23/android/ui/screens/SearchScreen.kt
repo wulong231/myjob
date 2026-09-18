@@ -14,15 +14,16 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -56,7 +57,7 @@ fun SearchScreen(navController: NavHostController, vm: AppViewModel = viewModel(
     var keyword by remember { mutableStateOf("") }
     val results by vm.searchResults.collectAsState()
     val loading by vm.searchLoading.collectAsState()
-    val listState = rememberLazyListState()
+    val listState = rememberLazyGridState()
 
     Column(modifier = Modifier.fillMaxSize()) {
         // 搜索框
@@ -106,28 +107,31 @@ fun SearchScreen(navController: NavHostController, vm: AppViewModel = viewModel(
                 Text("暂无搜索结果", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
-            LazyColumn(
+            // 网格自适应列数：手机单列，平板横屏多列
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(340.dp),
                 state = listState,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                    start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp
+                ),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                item {
+                item(span = { GridItemSpan(maxLineSpan) }) {
                     Text(
                         text = "共 ${formatCount(results.total)} 个结果",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                        modifier = Modifier.padding(vertical = 4.dp)
                     )
                 }
                 items(results.videos, key = { it.bvid }) { video ->
                     VideoResultItem(video) {
                         navController.navigate("detail/${video.bvid}")
                     }
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 16.dp),
-                        color = MaterialTheme.colorScheme.outlineVariant
-                    )
                 }
-                item {
+                item(span = { GridItemSpan(maxLineSpan) }) {
                     if (loading) {
                         Box(
                             modifier = Modifier
@@ -176,7 +180,7 @@ private fun VideoResultItem(video: VideoInfo, onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .padding(vertical = 8.dp)
     ) {
         Box {
             AsyncImage(

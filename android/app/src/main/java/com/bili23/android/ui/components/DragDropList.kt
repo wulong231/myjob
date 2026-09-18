@@ -1,7 +1,7 @@
 package com.bili23.android.ui.components
 
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -13,25 +13,28 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-/** 拖拽重排状态：长按拖动行时按指针悬停位置实时交换顺序（拖拽项实时跟随指针） */
-class DragDropListState(private val listState: LazyListState) {
+/** 拖拽重排状态：长按拖动项时按指针悬停位置实时交换顺序（拖拽项实时跟随指针）。支持单列列表与多列网格。 */
+class DragDropListState(private val gridState: LazyGridState) {
     var onMove: (Int, Int) -> Unit = { _, _ -> }
     var draggingItemIndex by mutableIntStateOf(-1)
         private set
 
-    /** 开始拖拽指定行 */
+    /** 开始拖拽指定项 */
     fun onDragStart(index: Int) {
         draggingItemIndex = index
     }
 
-    /** 拖拽中：pointerYInItem 为指针相对被拖行顶部的偏移，换算为列表坐标定位目标行并交换 */
-    fun onDrag(pointerYInItem: Float) {
+    /** 拖拽中：pointerX/YInItem 为指针相对被拖项左上角的偏移，换算为网格坐标定位目标项并交换（二维命中，多列网格正确换行） */
+    fun onDrag(pointerXInItem: Float, pointerYInItem: Float) {
         if (draggingItemIndex == -1) return
-        val item = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == draggingItemIndex }
+        val item = gridState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == draggingItemIndex }
             ?: return
-        val listY = item.offset + pointerYInItem
-        val target = listState.layoutInfo.visibleItemsInfo
-            .firstOrNull { listY >= it.offset && listY <= it.offset + it.size }
+        val gridX = item.offset.x + pointerXInItem
+        val gridY = item.offset.y + pointerYInItem
+        val target = gridState.layoutInfo.visibleItemsInfo.firstOrNull {
+            gridX >= it.offset.x && gridX <= it.offset.x + it.size.width &&
+                gridY >= it.offset.y && gridY <= it.offset.y + it.size.height
+        }
         if (target != null && target.index != draggingItemIndex) {
             val from = draggingItemIndex
             onMove(from, target.index)
@@ -46,7 +49,7 @@ class DragDropListState(private val listState: LazyListState) {
 
 @Composable
 fun rememberDragDropListState(
-    listState: LazyListState,
+    listState: LazyGridState,
     onMove: (Int, Int) -> Unit
 ): DragDropListState {
     val state = remember { DragDropListState(listState) }
@@ -56,8 +59,8 @@ fun rememberDragDropListState(
 }
 
 /**
- * 行内拖拽手柄修改器：仅多选模式启用。
- * 长按行最右侧（手柄区域，默认 44dp）拖动即可重排；index/rowWidthPx 需用实时取值 lambda 传入。
+ * 项内拖拽手柄修改器：仅多选模式启用。
+ * 长按项最右侧（手柄区域，默认 44dp）拖动即可重排；index/rowWidthPx 需用实时取值 lambda 传入。
  */
 fun Modifier.dragReorderHandle(
     state: DragDropListState,
@@ -77,7 +80,7 @@ fun Modifier.dragReorderHandle(
             },
             onDrag = { change, _ ->
                 change.consume()
-                state.onDrag(change.position.y)
+                state.onDrag(change.position.x, change.position.y)
             },
             onDragEnd = { state.onDragStop() },
             onDragCancel = { state.onDragStop() }

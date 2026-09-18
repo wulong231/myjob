@@ -112,6 +112,8 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
     val isLocal = localPath != null
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    // 平板（最小宽度 ≥ 600dp，如小米平板5Pro 2K 横屏使用）：横屏不自动全屏，仅手动全屏
+    val isTablet = configuration.smallestScreenWidthDp >= 600
 
     // 本地全部视频（作为单视频播放时的隐式队列；若从某收藏夹进入则只展示该夹内视频）
     val playlistFilter by vm.videoPlaylistFilter.collectAsState()
@@ -152,7 +154,7 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
 
     var player by remember { mutableStateOf<ExoPlayer?>(null) }
     var manualFullscreen by remember { mutableStateOf(false) }
-    val isFullscreen = isLandscape || manualFullscreen
+    val isFullscreen = (!isTablet && isLandscape) || manualFullscreen
 
     // 画面适配：false=适应屏幕(等比)，true=裁切铺满
     var cropFill by remember { mutableStateOf(false) }
@@ -432,23 +434,29 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                 androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             controller?.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
         } else {
-            activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            // 平板不强制竖屏（横屏使用），恢复系统默认方向；手机仍强制竖屏
+            activity?.requestedOrientation =
+                if (isTablet) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             controller?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
             applySystemBarTheme(window, isDarkThemeNow(context))
         }
         onDispose {
             com.bili23.android.FullscreenController.isFullscreen = false
-            activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            activity?.requestedOrientation =
+                if (isTablet) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             controller?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
             applySystemBarTheme(window, isDarkThemeNow(context))
         }
     }
 
-    /** 退出全屏：取消手动全屏并强制恢复竖屏（解决横屏状态下恢复按钮失效） */
+    /** 退出全屏：取消手动全屏并恢复方向（手机强制竖屏；平板恢复系统默认方向） */
     fun exitFullscreen() {
         manualFullscreen = false
         (context as? android.app.Activity)?.requestedOrientation =
-            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            if (isTablet) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
 
     // 全屏/横屏时拦截系统返回手势（左划边缘返回）：先退回竖屏播放界面，而不是直接退出播放器

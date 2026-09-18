@@ -23,6 +23,10 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -648,19 +652,21 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                 )
             }
         } else {
-            // 多选拖拽重排（长按行右侧手柄拖动）
-            val audioListState = rememberLazyListState()
+            // 多选拖拽重排（长按项右侧手柄拖动）；网格自适应列数：手机单列，平板横屏多列
+            val audioListState = rememberLazyGridState()
             val audioDragState = rememberDragDropListState(audioListState) { from, to ->
                 val fromPath = displayAudio.getOrNull(from)?.path
                 val toPath = displayAudio.getOrNull(to)?.path
                 if (fromPath != null && toPath != null) vm.moveAudioPath(fromPath, toPath)
             }
-            LazyColumn(
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(340.dp),
                 state = audioListState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(
                     start = 16.dp, end = 16.dp, bottom = 16.dp
                 ),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 itemsIndexed(displayAudio, key = { _, it -> it.path }) { index, item ->
