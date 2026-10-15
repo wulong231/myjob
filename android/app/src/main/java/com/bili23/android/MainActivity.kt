@@ -4,6 +4,10 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -124,7 +128,23 @@ private fun AppRoot(vm: AppViewModel = viewModel()) {
             NavHost(
                 navController = navController,
                 startDestination = "home",
-                modifier = Modifier.padding(padding)
+                modifier = Modifier.padding(padding),
+                enterTransition = {
+                    fadeIn(tween(250)) +
+                        slideIntoContainer(AnimatedContentTransitionScope.SlideDirection.Start, tween(350))
+                },
+                exitTransition = {
+                    fadeOut(tween(180)) +
+                        slideOutOfContainer(AnimatedContentTransitionScope.SlideDirection.Start, tween(250))
+                },
+                popEnterTransition = {
+                    fadeIn(tween(250)) +
+                        slideIntoContainer(AnimatedContentTransitionScope.SlideDirection.End, tween(350))
+                },
+                popExitTransition = {
+                    fadeOut(tween(180)) +
+                        slideOutOfContainer(AnimatedContentTransitionScope.SlideDirection.End, tween(250))
+                }
             ) {
                 composable("home") { HomeScreen(navController, vm) }
                 composable("search") { SearchScreen(navController, vm) }

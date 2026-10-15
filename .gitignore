@@ -33,8 +33,8 @@ config.json
 Thumbs.db
 
 # Android 工具链 / SDK / Gradle 缓存（体积巨大，不入库）
-android-sdk/
-gradle-dist/
+android/sdk/
+android/gradle-dist/
 venv/
 
 # Android 工程
@@ -46,6 +46,7 @@ android/captures/
 android/local.properties
 android/keystore/
 android/Bili23-release.apk
+android/android_backup_*/
 *.iml
 
 # 安装包 / APK 产物

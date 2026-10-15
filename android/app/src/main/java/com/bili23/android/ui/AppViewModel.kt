@@ -266,16 +266,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 音频排序：未编辑歌名/歌手的新歌排前端，已编辑（改过歌名/歌手）的排后面；同组内应用自定义顺序 */
+    /** 音频排序（默认「新歌优先」）：
+     *  1) 未编辑歌名/歌手的整组排在已编辑（改过歌名/歌手）的歌曲前面；
+     *  2) 组内新下载的歌曲（尚未纳入自定义顺序）排最前，且越新越靠前；
+     *  3) 其余歌曲保持自定义顺序。 */
     private fun sortAudioList(files: List<AudioItem>): List<AudioItem> {
-        val order = Settings.getCustomOrder(Settings.PLAYLIST_AUDIO)
-        val edited = files.filter {
+        val orderIdx = Settings.getCustomOrder(Settings.PLAYLIST_AUDIO)
+            .withIndex().associate { it.value to it.index }
+        val editedPaths = files.filter {
             val (t, a) = Settings.getAudioTag(it.path)
             t.isNotEmpty() || a.isNotEmpty()
-        }
-        val fresh = files.filter { it !in edited }
+        }.mapTo(HashSet()) { it.path }
+        val fresh = files.filter { it.path !in editedPaths }
+        val edited = files.filter { it.path in editedPaths }
+
+        // 修改时间只统计一次，避免排序比较过程中反复访问文件系统
+        val mtime = files.associate { it.path to File(it.path).lastModified() }
+
         fun sortGroup(list: List<AudioItem>): List<AudioItem> =
-            if (order.isEmpty()) list else Settings.reorderByCustom(list, order) { it.path }
+            list.sortedWith(
+                compareBy<AudioItem> { if (orderIdx.containsKey(it.path)) 1 else 0 } // 新歌在前
+                    .thenBy { orderIdx[it.path] ?: 0 }                              // 其余按自定义顺序
+                    .thenByDescending { mtime[it.path] ?: 0L }                       // 组内越新越靠前
+            )
+
         return sortGroup(fresh) + sortGroup(edited)
     }
 

@@ -88,6 +88,9 @@ object Settings {
     // ------------------------------------------------------------------
     const val PLAYLIST_VIDEO = "video"
     const val PLAYLIST_AUDIO = "audio"
+
+    /** 纯音乐分类：音频加入该分类时自动标记为纯音乐（不搜索歌词） */
+    const val INSTRUMENTAL_PLAYLIST = "纯音乐"
     private const val PLAYLISTS_KEY_VIDEO = "playlists_video_json"
     private const val PLAYLISTS_KEY_AUDIO = "playlists_audio_json"
     private const val PLAYLISTS_KEY_OLD = "playlists_json"
@@ -156,16 +159,17 @@ object Settings {
         if (map.remove(name) != null) savePlaylists(type, map)
     }
 
-    /** 将文件加入列表（自动去重） */
+    /** 将文件加入列表（自动去重；加入"纯音乐"分类时自动标记为纯音乐） */
     fun addToPlaylist(type: String, name: String, path: String) {
         val map = getPlaylists(type)
         val list = map[name] ?: mutableListOf()
         if (!list.contains(path)) list.add(path)
         map[name] = list
         savePlaylists(type, map)
+        if (isInstrumentalPlaylist(type, name)) markInstrumental(path)
     }
 
-    /** 批量将文件加入列表（自动去重） */
+    /** 批量将文件加入列表（自动去重；加入"纯音乐"分类时自动标记为纯音乐） */
     fun addAllToPlaylist(type: String, name: String, paths: List<String>) {
         if (paths.isEmpty()) return
         val map = getPlaylists(type)
@@ -173,6 +177,7 @@ object Settings {
         paths.forEach { if (!list.contains(it)) list.add(it) }
         map[name] = list
         savePlaylists(type, map)
+        if (isInstrumentalPlaylist(type, name)) paths.forEach { markInstrumental(it) }
     }
 
     /** 从列表移除文件 */
@@ -386,5 +391,61 @@ object Settings {
 
     fun setLyricOffset(path: String, offset: Long) {
         prefs.edit().putLong("lyric_offset_$path", offset).apply()
+    }
+
+    /** 桌面歌词（悬浮窗）开关 */
+    var desktopLyricsEnabled: Boolean
+        get() = prefs.getBoolean("desktop_lyrics", false)
+        set(value) {
+            prefs.edit().putBoolean("desktop_lyrics", value).apply()
+        }
+
+    /** 桌面歌词悬浮窗位置（-1 = 未设置，使用默认位置） */
+    var desktopLyricsX: Int
+        get() = prefs.getInt("desktop_lyrics_x", -1)
+        set(value) {
+            prefs.edit().putInt("desktop_lyrics_x", value).apply()
+        }
+
+    var desktopLyricsY: Int
+        get() = prefs.getInt("desktop_lyrics_y", -1)
+        set(value) {
+            prefs.edit().putInt("desktop_lyrics_y", value).apply()
+        }
+
+    /** 歌词模式背景：true=纯黑底，false=虚化封面（默认） */
+    var lyricsModeBlackBg: Boolean
+        get() = prefs.getBoolean("lyrics_mode_black_bg", false)
+        set(value) {
+            prefs.edit().putBoolean("lyrics_mode_black_bg", value).apply()
+        }
+
+    /**
+     * 本曲音量调整（分贝，-12~+12，0=原始音量）：按文件路径记忆，
+     * 播放该曲时由播放服务静态应用（负值衰减、正值增益提升），不做动态压缩。
+     */
+    fun getTrackGain(path: String): Float = prefs.getFloat("gain_$path", 0f)
+
+    fun setTrackGain(path: String, db: Float) {
+        prefs.edit().putFloat("gain_$path", db).apply()
+    }
+
+    /** 是否标记为纯音乐（标记后不自动搜索歌词，歌词固定显示"纯音乐"） */
+    fun isInstrumental(path: String): Boolean = prefs.getBoolean("instrumental_$path", false)
+
+    fun setInstrumental(path: String, value: Boolean) {
+        prefs.edit().putBoolean("instrumental_$path", value).apply()
+    }
+
+    /** 是否为"纯音乐"分类（仅音频类型） */
+    fun isInstrumentalPlaylist(type: String, name: String): Boolean =
+        type == PLAYLIST_AUDIO && name.trim() == INSTRUMENTAL_PLAYLIST
+
+    /** 标记为纯音乐：写入"纯音乐"歌词占位，从而不触发歌词搜索（仅对音频生效） */
+    fun markInstrumental(path: String) {
+        if (!isAudioPath(path)) return
+        setInstrumental(path, true)
+        setLyric(path, LRC_INSTRUMENTAL)
+        setLyricTranslation(path, "")
     }
 }

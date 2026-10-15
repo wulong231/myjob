@@ -1,5 +1,10 @@
 package com.bili23.android.ui.screens
 
+import android.content.Intent
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
 import com.bili23.android.BuildConfig
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -31,9 +36,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
+import com.bili23.android.data.PlaylistTransfer
 import com.bili23.android.data.Settings
 import com.bili23.android.ui.AppViewModel
 
@@ -45,6 +52,19 @@ fun SettingsScreen(vm: AppViewModel = viewModel(), navController: NavHostControl
     var showLogoutDialog by remember { mutableStateOf(false) }
     var showDirDialog by remember { mutableStateOf(false) }
     val loggedIn by vm.loggedIn.collectAsState()
+    val context = LocalContext.current
+
+    // 导入分类：选择其他手机导出的分类文件，合并到本机（不覆盖已有内容）
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val result = PlaylistTransfer.import(context, uri, vm.audioFiles.value)
+            Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+            // 导入可能同步了歌名/歌手，重新扫描以刷新列表显示
+            if (result.syncedTags > 0) vm.scanAudioFiles()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -91,6 +111,36 @@ fun SettingsScreen(vm: AppViewModel = viewModel(), navController: NavHostControl
             title = "下载目录",
             subtitle = vm.downloadDir.absolutePath
         ) { showDirDialog = true }
+
+        // 分类导入导出：多台手机共享同一套收藏夹
+        SettingsItem(
+            title = "导出分类",
+            subtitle = "生成分类文件，分享给其他手机（微信 / QQ / 蓝牙等）"
+        ) {
+            runCatching {
+                val file = PlaylistTransfer.export(context, vm.audioFiles.value)
+                val uri = FileProvider.getUriForFile(
+                    context, "${context.packageName}.fileprovider", file
+                )
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/json"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, "Bili23 分类备份")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                Toast.makeText(context, "已导出：${file.name}", Toast.LENGTH_LONG).show()
+                context.startActivity(Intent.createChooser(send, "导出分类"))
+            }.onFailure {
+                Toast.makeText(context, "导出失败：${it.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+
+        SettingsItem(
+            title = "导入分类",
+            subtitle = "选择其他手机导出的分类文件，合并到本机收藏夹"
+        ) {
+            importLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+        }
 
         Spacer(Modifier.height(24.dp))
         Text(

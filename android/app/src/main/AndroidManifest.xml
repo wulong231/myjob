@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 桌面歌词悬浮窗（需用户在系统设置中授权"显示在其他应用上层"） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:name=".Bili23App"
@@ -27,14 +29,48 @@
             </intent-filter>
         </activity>
 
+        <!-- 歌词模式：横屏全屏（虚化封面/纯黑底 + 旋转封面 + 大字进度时间 + 歌词） -->
+        <activity
+            android:name=".LyricsModeActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:theme="@style/Theme.Bili23" />
+
         <service
             android:name=".service.MusicPlaybackService"
-            android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false">
+            <!-- 允许系统媒体会话（originOS6 控制中心 / 锁屏 / AOD / 通知栏媒体卡）连接并控制播放 -->
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+
+        <!-- 接收硬件媒体键（耳机/蓝牙媒体键），转发给 MediaSession -->
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".service.VideoNotificationReceiver"
             android:exported="false" />
+
+        <!-- 分类（播放列表）导出文件分享给其他手机用 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 可分享路径：分类导出文件位于 应用外部目录/export/ -->
+<paths>
+    <external-files-path name="export" path="export/" />
+</paths>

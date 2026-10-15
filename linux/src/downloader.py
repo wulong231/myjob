@@ -10,6 +10,7 @@ import time
 import threading
 import logging
 import hashlib
+import json
 from pathlib import Path
 from typing import Optional, Callable, List
 
@@ -19,6 +20,11 @@ from .models import DownloadTask, DownloadStatus, MediaType, EpisodeInfo, VideoI
 from .utils import safe_makedirs, safe_delete
 
 logger = logging.getLogger(__name__)
+
+
+class DownloadInterrupted(RuntimeError):
+    """下载因暂停/取消/分片未完成而中止，任务保持当前状态（便于断点续传）"""
+
 
 # 默认分片大小：降低到 256KB，使小文件也有多个分片以实时显示进度
 CHUNK_SIZE = 256 * 1024  # 256 KB per chunk
@@ -232,6 +238,9 @@ class BilibiliDownloader:
                 self._download_danmaku(task)
             elif task.download_type == MediaType.COVER:
                 self._download_cover(task)
+        except DownloadInterrupted as e:
+            # 暂停/取消/分片未完成：保留当前状态，便于断点续传
+            logger.info(f"下载任务中止（保留状态）: {task.task_id}: {e}")
         except Exception as e:
             task.status = DownloadStatus.FAILED
             task.error_message = str(e)
@@ -469,17 +478,22 @@ class BilibiliDownloader:
             pass
         # 2. PyInstaller 打包模式：从解压临时目录 _MEIPASS/bin/ 查找
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            packed_ffmpeg = os.path.join(sys._MEIPASS, "bin", "ffmpeg.exe")
+            packed_ffmpeg = os.path.join(sys._MEIPASS, "bin", self._ffmpeg_bin_name())
             if os.path.exists(packed_ffmpeg):
                 return packed_ffmpeg
         # 3. 项目 bin/ 中的 ffmpeg（开发模式，放在 Bili23_core/bin/ffmpeg.exe）
         bundle_ffmpeg = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "bin", "ffmpeg.exe"
+            "bin", self._ffmpeg_bin_name()
         )
         if os.path.exists(bundle_ffmpeg):
             return bundle_ffmpeg
         return ""
+
+    @staticmethod
+    def _ffmpeg_bin_name() -> str:
+        """返回当前平台的 ffmpeg 可执行文件名（Windows 为 ffmpeg.exe）"""
+        return "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
 
     def _convert_audio(self, input_path: str, output_path: str, format: str = "mp3",
                        cover_path: str = None):
@@ -523,18 +537,14 @@ class BilibiliDownloader:
         cmd.append(output_path)
 
         logger.debug(f"ffmpeg 命令: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg 转换失败 (code={result.returncode}): {result.stderr[:500]}")
 
     def _download_with_resume(self, url: str, save_path: str, task: DownloadTask):
-        """支持断点续传的下载（支持实时进度反馈）"""
+        """支持断点续传的下载（支持实时进度反馈、暂停/取消响应、完整性校验）"""
         old_file_path = task.file_path
         task.file_path = save_path
-
-        existing_size = 0
-        if os.path.exists(save_path):
-            existing_size = os.path.getsize(save_path)
 
         client = get_client()
         total_size = 0
@@ -560,36 +570,53 @@ class BilibiliDownloader:
                 logger.warning(f"获取文件大小失败: {e}")
 
         task.total_size = total_size
-        logger.info(f"下载文件大小: {total_size} bytes, 已存在: {existing_size} bytes, URL: {url[:80]}...")
+        logger.info(f"下载文件大小: {total_size} bytes, URL: {url[:80]}...")
 
         if total_size == 0:
             task.file_path = old_file_path
             self._stream_download(url, save_path, task)
             return
 
-        if existing_size >= total_size and total_size > 0:
-            task.downloaded_size = existing_size
-            task.progress = 1.0
-            task.file_path = old_file_path
-            self._notify_progress(task)
-            return
+        # 磁盘空间检查，避免写满磁盘导致文件损坏
+        self._check_disk_space(save_path, total_size)
 
         # 分片下载
         num_chunks = self._get_chunk_count(total_size)
         chunk_size = (total_size + num_chunks - 1) // num_chunks
         task.chunks_total = num_chunks
 
+        # 断点续传：通过状态文件记录已完成分片，避免把预分配的空文件误判为已下载
+        state_file = save_path + ".state.json"
+        state = self._load_state(state_file, total_size, num_chunks, chunk_size)
+        pre_completed = state["completed"]  # 之前已完成的分片索引
+        base_bytes = state["base_bytes"]    # 之前已完成分片的字节数
+
         if not os.path.exists(save_path):
+            # 主文件不存在时，之前完成分片的数据也已丢失，需全部重下
+            pre_completed = set()
+            base_bytes = 0
             self._create_empty_file(save_path, total_size)
 
         # 全局进度跟踪（线程安全）
         lock = threading.Lock()
         chunk_downloaded_dict: Dict[int, int] = {}  # chunk_idx -> 该分片已下载字节数
-        completed_chunks: set = set()
+        completed_chunks: set = set()  # 本次新完成的分片
 
         # 最后一次全局通知时间（节流）
         task._last_progress_notify = 0.0
         task._sub_progress_last_bytes = 0
+
+        def _save_state_locked():
+            """将已完成分片写入状态文件（须在持有 lock 时调用）"""
+            try:
+                with open(state_file, "w") as f:
+                    json.dump({
+                        "total_size": total_size,
+                        "num_chunks": num_chunks,
+                        "completed": sorted(pre_completed | completed_chunks),
+                    }, f)
+            except Exception as e:
+                logger.debug(f"写入状态文件失败: {e}")
 
         def _notify_global(force: bool = False):
             """汇总所有分片进度并通知全局（带节流）"""
@@ -599,38 +626,39 @@ class BilibiliDownloader:
             task._last_progress_notify = now
 
             with lock:
-                total = existing_size
+                total = base_bytes
                 for ch_idx in range(num_chunks):
-                    ch_start = ch_idx * chunk_size
-                    if ch_start < existing_size:
+                    if ch_idx in pre_completed:
                         continue
                     if ch_idx in completed_chunks:
                         # 完整的分片
+                        ch_start = ch_idx * chunk_size
                         ch_end = min((ch_idx + 1) * chunk_size, total_size)
                         total += (ch_end - ch_start)
                     elif ch_idx in chunk_downloaded_dict:
                         total += chunk_downloaded_dict[ch_idx]
-            self._update_progress(task, total_size, total, completed_chunks)
+            self._update_progress(task, total_size, total, pre_completed | completed_chunks)
 
         def download_chunk_range(chunk_idx, start, end):
             chunk_file = f"{save_path}.chunk_{chunk_idx}"
             length = end - start
 
-            # 检查此分片是否已下载
+            # 检查此分片是否已下载（状态文件缺失时的兜底续传）
             if os.path.exists(chunk_file) and os.path.getsize(chunk_file) >= max(1, length):
+                try:
+                    self._merge_chunk(chunk_file, save_path, start)
+                    if os.path.exists(chunk_file):
+                        os.remove(chunk_file)
+                except Exception as merge_err:
+                    logger.warning(f"合并已下载分片失败 {chunk_idx}: {merge_err}")
                 with lock:
                     completed_chunks.add(chunk_idx)
+                    _save_state_locked()
                 _notify_global(force=True)
-                # 合并分片
-                with open(save_path, "r+b") as f:
-                    f.seek(start)
-                    with open(chunk_file, "rb") as cf:
-                        f.write(cf.read())
-                if os.path.exists(chunk_file):
-                    os.remove(chunk_file)
                 return
 
-            if not self._pause_event.is_set():
+            # 暂停/取消时不再启动新的分片下载
+            if not self._pause_event.is_set() or task.status != DownloadStatus.DOWNLOADING:
                 return
 
             # 实时子进度回调
@@ -641,44 +669,51 @@ class BilibiliDownloader:
 
             downloaded = download_chunk(url, chunk_file, start, end, progress_callback=chunk_cb)
 
-            if downloaded > 0:
+            # 下载期间被暂停/取消，保留分片文件以便续传
+            if task.status != DownloadStatus.DOWNLOADING:
+                return
+
+            if downloaded >= length:
                 # 合并分片到主文件
                 try:
-                    with open(save_path, "r+b") as f:
-                        f.seek(start)
-                        with open(chunk_file, "rb") as cf:
-                            f.write(cf.read())
+                    self._merge_chunk(chunk_file, save_path, start)
+                    if os.path.exists(chunk_file):
+                        try:
+                            os.remove(chunk_file)
+                        except Exception:
+                            pass
+                    with lock:
+                        completed_chunks.add(chunk_idx)
+                        _save_state_locked()
                 except Exception as merge_err:
                     logger.warning(f"合并分片失败 {chunk_idx}: {merge_err}")
-
-                if os.path.exists(chunk_file):
-                    try:
-                        os.remove(chunk_file)
-                    except Exception:
-                        pass
-
-                with lock:
-                    completed_chunks.add(chunk_idx)
-                    chunk_downloaded_dict[chunk_idx] = length
                 _notify_global(force=True)
+            else:
+                # 分片不完整（服务端截断等），删除后重下
+                logger.warning(f"分片 {chunk_idx} 下载不完整（{downloaded}/{length} bytes），将重试")
+                try:
+                    os.remove(chunk_file)
+                except Exception:
+                    pass
 
         threads = []
         for i in range(num_chunks):
+            if i in pre_completed:
+                continue
             start = i * chunk_size
             end = min(start + chunk_size, total_size)
-            if start >= existing_size:
-                t = threading.Thread(
-                    target=download_chunk_range,
-                    args=(i, start, end),
-                    daemon=True
-                )
-                threads.append(t)
+            t = threading.Thread(
+                target=download_chunk_range,
+                args=(i, start, end),
+                daemon=True
+            )
+            threads.append(t)
 
         for t in threads:
             t.start()
 
         for t in threads:
-            t.join(timeout=180)
+            t.join()
 
         # 清理未完成的分片
         for i in range(num_chunks):
@@ -689,47 +724,83 @@ class BilibiliDownloader:
                 except Exception:
                     pass
 
-        # 最终强制 100% 进度
+        # 完整性校验：所有分片必须全部完成，且文件大小达标
+        all_completed = (len(pre_completed) + len(completed_chunks)) >= num_chunks
+        if all_completed and os.path.exists(save_path) and os.path.getsize(save_path) < total_size:
+            all_completed = False
+
+        if not all_completed:
+            # 保留主文件与状态文件以便续传；不再强制标记完成
+            if task.status == DownloadStatus.DOWNLOADING:
+                task.status = DownloadStatus.FAILED
+                task.error_message = "下载中断，部分分片未完成，可重新下载续传"
+                self._notify_progress(task)
+            raise DownloadInterrupted(task.error_message or "下载未完成")
+
+        # 全部完成：删除状态文件，标记完成
+        try:
+            os.remove(state_file)
+        except Exception:
+            pass
         task.progress = 1.0
         task.downloaded_size = total_size
         self._notify_progress(task)
         task.file_path = old_file_path
 
-    def _stream_download(self, url: str, save_path: str, task: DownloadTask):
-        """无法获取文件大小时的流式下载"""
+    def _stream_download(self, url: str, save_path: str, task: DownloadTask,
+                         max_retries: int = 3):
+        """无法获取文件大小时的流式下载（支持断点续传与自动重试）"""
         from .network import get_client
 
         client = get_client()
         task.file_path = save_path
         downloaded = 0
-        last_notify = 0
+        if os.path.exists(save_path):
+            downloaded = os.path.getsize(save_path)
 
-        try:
-            with client.stream("GET", url, follow_redirects=True) as response:
-                if response.status_code not in (200, 206):
-                    raise RuntimeError(f"下载失败: HTTP {response.status_code}")
+        for attempt in range(max_retries + 1):
+            last_notify = 0
+            try:
+                headers = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else {}
+                with client.stream("GET", url, headers=headers, follow_redirects=True) as response:
+                    if response.status_code not in (200, 206):
+                        raise RuntimeError(f"下载失败: HTTP {response.status_code}")
 
-                with open(save_path, "wb") as f:
-                    for chunk in response.iter_bytes(chunk_size=65536):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            task.downloaded_size = downloaded
-                            # 每 512KB 通知一次
-                            now = time.time()
-                            if now - last_notify >= 0.3:
-                                if hasattr(task, '_stream_last_bytes'):
-                                    task.download_speed = (downloaded - task._stream_last_bytes) / (now - last_notify)
-                                task._stream_last_bytes = downloaded
-                                last_notify = now
-                                self._notify_progress(task)
+                    # 服务端不支持 Range 时需从头重新下载
+                    if response.status_code == 200 and downloaded > 0:
+                        downloaded = 0
 
-            task.progress = 1.0
-            task.downloaded_size = downloaded
-            logger.info(f"流式下载完成: {save_path} ({downloaded} bytes)")
-        except Exception as e:
-            logger.error(f"流式下载失败: {e}")
-            raise
+                    mode = "wb" if downloaded == 0 else "ab"
+                    with open(save_path, mode) as f:
+                        for chunk in response.iter_bytes(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                task.downloaded_size = downloaded
+                                # 节流通知
+                                now = time.time()
+                                if now - last_notify >= 0.3:
+                                    if hasattr(task, '_stream_last_bytes'):
+                                        task.download_speed = (downloaded - task._stream_last_bytes) / (now - last_notify)
+                                    task._stream_last_bytes = downloaded
+                                    last_notify = now
+                                    self._notify_progress(task)
+
+                task.progress = 1.0
+                task.downloaded_size = downloaded
+                logger.info(f"流式下载完成: {save_path} ({downloaded} bytes)")
+                return
+            except Exception as e:
+                if attempt < max_retries:
+                    wait = (attempt + 1) * 2
+                    logger.warning(
+                        f"流式下载中断 (第{attempt + 1}/{max_retries}次): {e}，"
+                        f"等待{wait}秒后续传"
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.error(f"流式下载失败: {e}")
+                raise
 
     def _get_chunk_count(self, total_size: int) -> int:
         """获取分片数量"""
@@ -741,13 +812,73 @@ class BilibiliDownloader:
         return min(count, threads * 4)
 
     def _create_empty_file(self, path: str, size: int):
-        """创建空文件并预分配空间"""
+        """创建文件并预分配空间（大文件用 seek，避免一次性分配巨大内存）"""
         if _cfg().get(_cfg().preallocate_file_space):
             with open(path, "wb") as f:
-                f.write(b"\0" * size)
+                if size > 0:
+                    f.seek(size - 1)
+                    f.write(b"\0")
         else:
             with open(path, "wb") as f:
                 pass
+
+    def _load_state(self, state_file: str, total_size: int, num_chunks: int,
+                    chunk_size: int) -> dict:
+        """读取断点续传状态文件；缺失或无效时返回空状态"""
+        result = {"completed": set(), "base_bytes": 0}
+        try:
+            if not os.path.exists(state_file):
+                return result
+            with open(state_file, "r") as f:
+                state = json.load(f)
+            if state.get("total_size") != total_size or state.get("num_chunks") != num_chunks:
+                return result
+            base = 0
+            completed = set()
+            for i in state.get("completed", []):
+                i = int(i)
+                if i < 0 or i >= num_chunks:
+                    continue
+                completed.add(i)
+                ch_start = i * chunk_size
+                ch_end = min(ch_start + chunk_size, total_size)
+                base += (ch_end - ch_start)
+            result["completed"] = completed
+            result["base_bytes"] = base
+        except Exception as e:
+            logger.warning(f"读取断点续传状态失败，将重新下载: {e}")
+        return result
+
+    def _check_disk_space(self, save_path: str, required: int):
+        """检查目标磁盘空间是否充足，不足则抛出异常以避免文件损坏"""
+        import shutil
+        try:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(save_path))).free
+        except Exception:
+            return
+        # 音视频分片同时落盘、合并时还需额外空间，按 2.5 倍预留
+        need = int(required * 2.5)
+        if free < required:
+            raise RuntimeError(
+                f"磁盘空间不足：文件需要 {required / 1024 / 1024:.0f} MB，"
+                f"可用 {free / 1024 / 1024:.0f} MB"
+            )
+        if free < need:
+            logger.warning(
+                f"磁盘空间偏少：建议预留 {need / 1024 / 1024:.0f} MB（含合并临时空间），"
+                f"当前可用 {free / 1024 / 1024:.0f} MB"
+            )
+
+    def _merge_chunk(self, chunk_file: str, save_path: str, start: int):
+        """将分片文件按偏移写入主文件（分块拷贝，避免大分片占用过多内存）"""
+        with open(save_path, "r+b") as f:
+            f.seek(start)
+            with open(chunk_file, "rb") as cf:
+                while True:
+                    buf = cf.read(1024 * 1024)
+                    if not buf:
+                        break
+                    f.write(buf)
 
     def _update_progress(self, task: DownloadTask, total_size: int, downloaded_bytes: int,
                          completed_chunks: Optional[set] = None):
@@ -865,7 +996,7 @@ class BilibiliDownloader:
                         movflags="faststart",
                     )
                     .overwrite_output()
-                    .run(capture_stdout=True, capture_stderr=True, timeout=300)
+                    .run(capture_stdout=True, capture_stderr=True, timeout=900)
                 )
                 logger.info(f"音视频合并成功: {output_path}")
                 return
@@ -885,7 +1016,7 @@ class BilibiliDownloader:
                 output_path
             ]
             try:
-                result = subprocess.run(cmd, capture_output=True, timeout=300)
+                result = subprocess.run(cmd, capture_output=True, timeout=900)
                 if result.returncode == 0:
                     logger.info(f"音视频合并成功（命令行）: {output_path}")
                     return

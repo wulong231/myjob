@@ -53,10 +53,18 @@ android/
 ├── keystore/bili23-release.jks       # 签名文件（bili23/bili23123）
 └── Bili23-release.apk                # 构建工作副本（正式包放在 安装包/ 下）
 
-工程根目录（bi23/）：
-- 安装包/                 # 正式 APK 归档（旧版本放 安装包/旧版本/）
-- android-sdk/ gradle-dist/  # 本地构建工具链（勿动）
-- src/ main.py 桌面版源码；dist/ Bili23.exe 桌面版产物
+工程根目录（bi23/）—— 三个项目各自独立目录，互不干扰：
+- android/                 # 安卓工程 + 工具链 + APK 归档（本说明所在目录）
+  ├── app/ gradle/ gradlew.bat ...   # 安卓工程本体
+  ├── sdk/ gradle-dist/    # 本地构建工具链（勿动、勿删）
+  ├── keystore/            # 签名文件
+  ├── 安装包/               # 正式 APK 归档（旧版本放 安装包/旧版本/）
+  └── Bili-Android-开发说明.txt / 技术路线.md
+- windows/                 # 桌面版（Windows）：main.py src/ assets/ bin/ venv/
+  ├── build.bat            # 打包（产物 dist/Bili23.exe）
+  ├── run.bat              # 运行；install.bat 安装依赖
+  └── .bili23/ downloads/  # 运行时数据（配置/数据库/日志、下载文件）
+- linux/                   # 桌面版（Linux）：main.py src/ assets/ run.sh build.sh
 
 --------------------------------------------------------
 三、技术栈
@@ -149,8 +157,8 @@ android/
 注意：签名不一致无法覆盖安装，测试时先卸载旧包。
 
 本地工具链（勿删除）：
-- android-sdk/       Android SDK（含 platform-tools/adb.exe）
-- gradle-dist/       Gradle 发行版
+- android/sdk/          Android SDK（含 platform-tools/adb.exe）
+- android/gradle-dist/  Gradle 发行版
 - 依赖网络受限时自动走镜像（PyPI 同理）
 
 --------------------------------------------------------

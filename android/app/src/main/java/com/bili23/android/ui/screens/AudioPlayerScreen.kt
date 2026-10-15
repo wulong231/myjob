@@ -1,8 +1,17 @@
 package com.bili23.android.ui.screens
 
 import android.content.Intent
+import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -35,6 +44,7 @@ import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Pause
@@ -45,6 +55,8 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
@@ -60,6 +72,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -74,6 +87,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -88,8 +102,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import com.bili23.android.LyricsModeActivity
 import com.bili23.android.data.AudioItem
+import com.bili23.android.data.LRC_INSTRUMENTAL
+import com.bili23.android.data.LyricLine
 import com.bili23.android.data.Settings
+import com.bili23.android.data.currentLyricIndex
+import com.bili23.android.data.parseLrc
 import com.bili23.android.service.MusicPlaybackService
 import com.bili23.android.ui.AppViewModel
 import com.bili23.android.ui.components.CompactIconButton
@@ -97,61 +116,6 @@ import com.bili23.android.ui.components.dragReorderHandle
 import com.bili23.android.ui.components.rememberDragDropListState
 import java.io.File
 import kotlinx.coroutines.launch
-
-/** 歌词行 */
-private data class LyricLine(val timeMs: Long, val text: String)
-
-/** 解析 LRC 文本 → 歌词行列表（过滤空行与词曲编曲等元信息行，避免与翻译错位） */
-private fun parseLrc(lrc: String): List<LyricLine> {
-    val lines = mutableListOf<LyricLine>()
-    val regex = Regex("\\[(\\d{1,2}):(\\d{1,2})(?:\\.(\\d{1,3}))?]")
-    for (raw in lrc.split("\n")) {
-        val matches = regex.findAll(raw).toList()
-        if (matches.isEmpty()) continue
-        val text = raw.substringAfterLast(']').trim()
-        if (text.isEmpty()) continue
-        // 过滤词曲编曲、制作人等非歌词元信息行（日译中时这些行会与翻译错位）
-        if (isCreditLine(text)) continue
-        for (m in matches) {
-            val min = m.groupValues[1].toIntOrNull() ?: 0
-            val sec = m.groupValues[2].toIntOrNull() ?: 0
-            val msPart = m.groupValues[3]
-            val ms = when (msPart.length) {
-                1 -> msPart.toIntOrNull()?.times(100) ?: 0
-                2 -> msPart.toIntOrNull()?.times(10) ?: 0
-                3 -> msPart.toIntOrNull() ?: 0
-                else -> 0
-            }
-            lines.add(LyricLine(min * 60_000L + sec * 1000L + ms, text))
-        }
-    }
-    return lines.sortedBy { it.timeMs }
-}
-
-/** 是否为词曲编曲等元信息行（不计入歌词显示） */
-private fun isCreditLine(text: String): Boolean {
-    val t = text.trim()
-    if (t.isEmpty()) return true
-    // 词曲编曲/制作/标注 等，以及 [ti:][ar:][by:][al:] 标签
-    return Regex(
-        "^(作词|作曲|编曲|制作人|制作|监制|混音|录音|母带|和声|吉他|贝斯|鼓手|键盘|钢琴|弦乐|出品|" +
-            "producer|composer|lyricist|arranger|mix|record|master)\\s*[:：]",
-        RegexOption.IGNORE_CASE
-    ).containsMatchIn(t) ||
-            Regex("^(by|ti|ar|al|offset)\\s*[:：]", RegexOption.IGNORE_CASE).containsMatchIn(t)
-}
-
-/** 当前播放行索引（考虑偏移） */
-private fun currentLyricIndex(lines: List<LyricLine>, posMs: Long, offsetMs: Long): Int {
-    if (lines.isEmpty()) return -1
-    val adjusted = posMs - offsetMs
-    var idx = -1
-    for (i in lines.indices) {
-        if (adjusted >= lines[i].timeMs) idx = i
-        else break
-    }
-    return idx
-}
 
 /** 毫秒 → mm:ss */
 private fun formatMs(ms: Long): String {
@@ -208,16 +172,29 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
     var sortMode by remember { mutableStateOf(0) }
     var showSortDialog by remember { mutableStateOf(false) }
 
-    // 当前展示的音频列表：按播放列表 + 歌手 + 搜索词三重筛选，再按排序方式排列
-    val displayAudio = run {
+    // 当前展示的音频列表：按播放列表 + 歌手 + 搜索词三重筛选，再按排序方式排列。
+    // 结果按依赖项缓存：避免每次重组（进度轮询每 250ms 触发一次）都重复筛选列表
+    val displayAudio = remember(
+        audioFiles, selectedPlaylist, selectedArtist, searchKeyword, sortMode, playlistTick
+    ) {
+        // 选中播放列表的路径集合只解析一次：
+        // Settings.getPlaylists 需读取并解析整份 JSON，逐项调用会造成滚动卡顿
+        val playlistPaths = selectedPlaylist?.let { name ->
+            Settings.getPlaylists(Settings.PLAYLIST_AUDIO)[name]?.toSet() ?: emptySet()
+        }
         val base = audioFiles.filter { item ->
-            (selectedPlaylist == null || Settings.isInPlaylist(Settings.PLAYLIST_AUDIO, selectedPlaylist!!, item.path)) &&
+            (playlistPaths == null || item.path in playlistPaths) &&
                 (selectedArtist == null || item.artist == selectedArtist) &&
                 (searchKeyword.isBlank() ||
                     item.artist.contains(searchKeyword, ignoreCase = true) ||
                     item.displayTitle.contains(searchKeyword, ignoreCase = true))
         }
         if (sortMode == 1) base.sortedBy { it.displayTitle.lowercase() } else base
+    }
+
+    // 已加入自建播放列表的音频路径集合（列表项红点标记用，避免每个列表项遍历全部列表）
+    val userPlaylistPaths = remember(playlistTick) {
+        playlists.filterKeys { it != Settings.DEFAULT_AUDIO_FAVORITES }.values.flatten().toSet()
     }
 
     // 多选模式
@@ -296,6 +273,15 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             lyricStatus = ""
             return@LaunchedEffect
         }
+        // 纯音乐：不搜索歌词，直接显示"纯音乐"
+        if (Settings.isInstrumental(path)) {
+            lyrics = parseLrc(LRC_INSTRUMENTAL)
+            translations = emptyList()
+            lyricOffset = 0L
+            lyricLoading = false
+            lyricStatus = ""
+            return@LaunchedEffect
+        }
         lyricLoading = true
         lyricStatus = "正在自动匹配歌词..."
         lyrics = emptyList()
@@ -345,6 +331,35 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
     val current = audioFiles.firstOrNull { it.path == currentPath }
     // 是否显示歌词（顶部按钮可开关，默认关闭）
     var showLyrics by remember { mutableStateOf(false) }
+    // 桌面歌词悬浮窗开关（由服务静态状态轮询同步）
+    var overlayOn by remember { mutableStateOf(false) }
+
+    /** 切换桌面歌词悬浮窗：未授权时先跳转系统"显示在其他应用上层"设置 */
+    fun toggleOverlay() {
+        if (!MusicPlaybackService.overlayActive &&
+            !android.provider.Settings.canDrawOverlays(context)
+        ) {
+            android.widget.Toast.makeText(
+                context,
+                "请开启\"显示在其他应用上层\"权限后，再点一次开启桌面歌词",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+            runCatching {
+                context.startActivity(
+                    Intent(
+                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:${context.packageName}")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            return
+        }
+        context.startService(
+            Intent(context, MusicPlaybackService::class.java).apply {
+                action = MusicPlaybackService.ACTION_TOGGLE_OVERLAY
+            }
+        )
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // 顶部：菜单 + 标题 + 歌词搜索 + 歌词开关
@@ -371,6 +386,25 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                     tint = if (showLyrics) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                 )
+            }
+            // 桌面歌词（悬浮窗）开关
+            IconButton(onClick = { toggleOverlay() }) {
+                Icon(
+                    Icons.Filled.Subtitles,
+                    contentDescription = if (overlayOn) "关闭桌面歌词" else "开启桌面歌词",
+                    tint = if (overlayOn) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                )
+            }
+            // 歌词模式（横屏全屏：虚化封面/纯黑底 + 旋转封面 + 大字进度时间）
+            IconButton(onClick = {
+                runCatching {
+                    context.startActivity(
+                        Intent(context, LyricsModeActivity::class.java)
+                    )
+                }
+            }) {
+                Icon(Icons.Filled.Fullscreen, contentDescription = "歌词模式")
             }
         }
 
@@ -600,7 +634,11 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             }
 
             // 歌词显示区（滚动高亮 + 点击跳转 + 偏移微调 + 本地编辑，顶部按钮可关闭）
-            if (showLyrics && lyrics.isNotEmpty()) {
+            AnimatedVisibility(
+                visible = showLyrics && lyrics.isNotEmpty(),
+                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(tween(250)),
+                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(tween(200))
+            ) {
                 val curIdx = currentLyricIndex(lyrics, position, lyricOffset)
                 Box {
                     LyricsView(
@@ -756,10 +794,7 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                                     else MaterialTheme.colorScheme.onSurface
                                 )
                                 // 未加入任何自建播放列表的歌曲用小红点标记，便于整理
-                                val inUserPlaylist = playlists.entries.any { (name, paths) ->
-                                    name != Settings.DEFAULT_AUDIO_FAVORITES && item.path in paths
-                                }
-                                if (!inUserPlaylist) {
+                                if (item.path !in userPlaylistPaths) {
                                     Spacer(Modifier.width(6.dp))
                                     Box(
                                         modifier = Modifier
@@ -828,7 +863,7 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
         EditTagDialog(
             item = item,
             onDismiss = { editTagItem = null },
-            onSave = { title, artist ->
+            onSave = { title, artist, instrumental ->
                 // 编辑后双重查重：歌名 + 歌手与已有歌曲相同则阻止保存，避免出现重复歌曲
                 val dup = vm.findDuplicateAudio(title, title, artist)
                 if (dup != null && dup.path != item.path) {
@@ -841,6 +876,20 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
                 } else {
                     vm.updateAudioTag(item.path, title, artist)
                     vm.renameAudioByTag(item.path, title, artist)
+                    // 纯音乐标记：写入"纯音乐"歌词（从而不自动搜索）；取消勾选则清除
+                    Settings.setInstrumental(item.path, instrumental)
+                    if (instrumental) {
+                        Settings.setLyric(item.path, LRC_INSTRUMENTAL)
+                        Settings.setLyricTranslation(item.path, "")
+                    } else if (Settings.getLyric(item.path) == LRC_INSTRUMENTAL) {
+                        Settings.clearLyric(item.path)
+                    }
+                    // 正在展示该曲目时立即刷新歌词显示
+                    if (currentPath == item.path) {
+                        lyrics = parseLrc(Settings.getLyric(item.path))
+                        translations = emptyList()
+                        lyricOffset = 0L
+                    }
                     editTagItem = null
                 }
             }
@@ -999,6 +1048,7 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
             duration = MusicPlaybackService.currentDuration
             isPlaying = MusicPlaybackService.isPlaying
             playMode = MusicPlaybackService.playMode
+            overlayOn = MusicPlaybackService.overlayActive
             val sp = MusicPlaybackService.currentPath
             if (sp.isNotEmpty() && sp != currentPath) {
                 // 服务端已切歌（自动下一首/上一首等），同步本地当前曲目
@@ -1122,7 +1172,7 @@ private fun LyricsView(
     }
 }
 
-/** 当前播放卡片：封面 + 进度拖拽 + 上一首/播放/下一首 + 播放模式 */
+/** 当前播放卡片：封面 + 进度拖拽 + 上一首/播放/下一首 + 播放模式 + 本曲音量 */
 @Composable
 private fun NowPlayingCard(
     item: AudioItem,
@@ -1136,6 +1186,11 @@ private fun NowPlayingCard(
     onSeek: (Long) -> Unit,
     onCycleMode: () -> Unit
 ) {
+    val context = LocalContext.current
+    // 本曲音量调整对话框开关
+    var showGainDialog by remember { mutableStateOf(false) }
+    // 该曲已保存的增益（非 0 时按钮高亮，提示此曲已被调整过）
+    val savedGain = remember(item.path) { Settings.getTrackGain(item.path) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1145,12 +1200,23 @@ private fun NowPlayingCard(
             .padding(16.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // 封面
+            // 封面：播放时缓慢旋转（转盘效果），暂停时平滑停在当前角度
+            var coverRotation by remember { mutableFloatStateOf(0f) }
+            LaunchedEffect(isPlaying) {
+                if (!isPlaying) return@LaunchedEffect
+                var last = withFrameNanos { it }
+                while (true) {
+                    val now = withFrameNanos { it }
+                    coverRotation = (coverRotation + (now - last) / 1_000_000_000f * 45f) % 360f
+                    last = now
+                }
+            }
             Box(
                 modifier = Modifier
                     .size(44.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(MaterialTheme.colorScheme.primaryContainer),
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primaryContainer)
+                    .graphicsLayer { rotationZ = coverRotation },
                 contentAlignment = Alignment.Center
             ) {
                 if (item.coverPath.isNotEmpty()) {
@@ -1159,7 +1225,7 @@ private fun NowPlayingCard(
                         contentDescription = item.displayTitle,
                         modifier = Modifier
                             .size(44.dp)
-                            .clip(RoundedCornerShape(10.dp)),
+                            .clip(CircleShape),
                         contentScale = ContentScale.Crop
                     )
                 } else {
@@ -1230,11 +1296,26 @@ private fun NowPlayingCard(
                 Icon(Icons.Filled.SkipPrevious, contentDescription = "上一首")
             }
             IconButton(onClick = onPlayPause) {
-                Icon(
-                    if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                    contentDescription = "播放/暂停",
-                    modifier = Modifier.size(44.dp)
+                val btnScale by animateFloatAsState(
+                    targetValue = if (isPlaying) 1f else 0.82f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    label = "playButtonScale"
                 )
+                Crossfade(
+                    targetState = isPlaying,
+                    modifier = Modifier.scale(btnScale),
+                    animationSpec = tween(180),
+                    label = "playPauseIcon"
+                ) { playing ->
+                    Icon(
+                        if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = "播放/暂停",
+                        modifier = Modifier.size(44.dp)
+                    )
+                }
             }
             IconButton(onClick = onNext) {
                 Icon(Icons.Filled.SkipNext, contentDescription = "下一首")
@@ -1247,6 +1328,15 @@ private fun NowPlayingCard(
                     else -> Icons.Filled.Repeat to "顺序播放"
                 }
                 Icon(icon, contentDescription = desc, tint = MaterialTheme.colorScheme.primary)
+            }
+            // 本曲音量：手动调节该曲增益（-12~+12 dB），按文件记忆
+            IconButton(onClick = { showGainDialog = true }) {
+                Icon(
+                    Icons.Filled.VolumeUp,
+                    contentDescription = "本曲音量",
+                    tint = if (savedGain != 0f) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
         Text(
@@ -1262,6 +1352,91 @@ private fun NowPlayingCard(
             modifier = Modifier.fillMaxWidth()
         )
     }
+
+    // 本曲音量对话框：保存后由播放服务静态应用一次，并按文件路径记忆
+    if (showGainDialog) {
+        TrackGainDialog(
+            item = item,
+            onDismiss = { showGainDialog = false },
+            onSaved = { db ->
+                showGainDialog = false
+                Toast.makeText(
+                    context,
+                    if (db == 0f) "已恢复原始音量" else "本曲音量已保存（%+.0f dB）".format(db),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        )
+    }
+}
+
+/** 本曲音量调整对话框：-12~+12 dB，按文件路径记忆，只影响当前歌曲 */
+@Composable
+private fun TrackGainDialog(
+    item: AudioItem,
+    onDismiss: () -> Unit,
+    onSaved: (Float) -> Unit
+) {
+    var gain by remember { mutableFloatStateOf(Settings.getTrackGain(item.path)) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("本曲音量调整") },
+        text = {
+            Column {
+                Text(
+                    "仅对《${item.displayTitle}》生效，保存后自动记忆，下次播放该曲沿用此音量。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = if (gain == 0f) "原始音量" else "%+.1f dB".format(gain),
+                    style = MaterialTheme.typography.titleMedium,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Slider(
+                    value = gain,
+                    onValueChange = { gain = it },
+                    valueRange = -12f..12f,
+                    steps = 23
+                )
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "-12 dB",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        "+12 dB",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (gain > 0f) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "提升音量由系统音效增益实现，实际幅度可能受设备限制。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                Settings.setTrackGain(item.path, gain)
+                onSaved(gain)
+            }) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                Settings.setTrackGain(item.path, 0f)
+                onSaved(0f)
+            }) { Text("重置") }
+        }
+    )
 }
 
 /** 标签编辑对话框 */
@@ -1269,10 +1444,12 @@ private fun NowPlayingCard(
 private fun EditTagDialog(
     item: AudioItem,
     onDismiss: () -> Unit,
-    onSave: (String, String) -> Unit
+    onSave: (String, String, Boolean) -> Unit
 ) {
     var title by remember { mutableStateOf(item.title) }
     var artist by remember { mutableStateOf(item.artist) }
+    // 纯音乐标记：勾选后不自动搜索歌词，歌词固定显示"纯音乐"
+    var instrumental by remember { mutableStateOf(Settings.isInstrumental(item.path)) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1294,10 +1471,21 @@ private fun EditTagDialog(
                     label = { Text("歌手") },
                     singleLine = true
                 )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { instrumental = !instrumental },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(checked = instrumental, onCheckedChange = { instrumental = it })
+                    Text("纯音乐（不搜索歌词）", style = MaterialTheme.typography.bodyMedium)
+                }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSave(title.trim(), artist.trim()) }) { Text("保存") }
+            TextButton(onClick = { onSave(title.trim(), artist.trim(), instrumental) }) { Text("保存") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
