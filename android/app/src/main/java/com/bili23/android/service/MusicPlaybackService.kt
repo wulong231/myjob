@@ -159,6 +159,42 @@ class MusicPlaybackService : MediaSessionService() {
         @Volatile
         var pausedForHeadset: Boolean = false
             private set
+
+        /**
+         * 最近一次播放列表快照：通知栏"关闭"会停止服务并清空列表，
+         * App 内再次点播放时用这份快照恢复，避免"关闭通知后无法继续播放"
+         */
+        @Volatile
+        var lastPaths: List<String> = emptyList()
+            private set
+        @Volatile
+        var lastTitles: List<String> = emptyList()
+            private set
+        @Volatile
+        var lastArtists: List<String> = emptyList()
+            private set
+        @Volatile
+        var lastCovers: List<String> = emptyList()
+            private set
+        @Volatile
+        var lastIndex: Int = 0
+            private set
+
+        /** 保存当前列表快照（停止服务前调用） */
+        fun saveSnapshot(
+            paths: List<String>,
+            titles: List<String>,
+            artists: List<String>,
+            covers: List<String>,
+            index: Int
+        ) {
+            if (paths.isEmpty()) return
+            lastPaths = paths
+            lastTitles = titles
+            lastArtists = artists
+            lastCovers = covers
+            lastIndex = index
+        }
     }
 
     private data class Track(
@@ -384,6 +420,14 @@ class MusicPlaybackService : MediaSessionService() {
     /** 停止播放并退出服务（定时到时/停止按钮共用） */
     private fun stopPlaybackAndSelf() {
         mainHandler.removeCallbacks(fgsGuard)
+        // 先保存列表快照：关闭通知后 App 内仍可点播放继续
+        saveSnapshot(
+            tracks.map { it.path },
+            tracks.map { it.title },
+            tracks.map { it.artist },
+            tracks.map { it.cover },
+            currentIndex.coerceAtLeast(0)
+        )
         player.stop()
         player.clearMediaItems()
         tracks.clear()
@@ -710,12 +754,16 @@ class MusicPlaybackService : MediaSessionService() {
 
             ACTION_PLAY -> {
                 MediaArbiter.stopVideo(this)
-                player.play()
+                if (player.mediaItemCount == 0) restoreLastPlaylist() else player.play()
             }
             ACTION_PAUSE -> player.pause()
-            ACTION_TOGGLE -> if (player.isPlaying) player.pause() else player.play()
-            ACTION_PREV -> skipPrev()
-            ACTION_NEXT -> skipNext()
+            ACTION_TOGGLE -> when {
+                player.isPlaying -> player.pause()
+                player.mediaItemCount == 0 -> restoreLastPlaylist()
+                else -> player.play()
+            }
+            ACTION_PREV -> if (player.mediaItemCount == 0) restoreLastPlaylist() else skipPrev()
+            ACTION_NEXT -> if (player.mediaItemCount == 0) restoreLastPlaylist() else skipNext()
             ACTION_TIMER -> cycleTimer()
             ACTION_TOGGLE_OVERLAY -> toggleOverlay()
             ACTION_STOP -> {
@@ -793,6 +841,26 @@ class MusicPlaybackService : MediaSessionService() {
         player.prepare()
         player.playWhenReady = autoPlay
         syncState()
+    }
+
+    /**
+     * 服务已被通知栏"关闭"停止后，再次收到播放指令（App 内点播放等）时，
+     * 用上次播放列表快照恢复曲目并继续播放
+     */
+    private fun restoreLastPlaylist() {
+        if (lastPaths.isEmpty()) return
+        tracks.clear()
+        lastPaths.indices.forEach { i ->
+            tracks.add(
+                Track(
+                    path = lastPaths[i],
+                    title = lastTitles.getOrElse(i) { "" },
+                    artist = lastArtists.getOrElse(i) { "" },
+                    cover = lastCovers.getOrElse(i) { "" }
+                )
+            )
+        }
+        playTrack(lastIndex.coerceIn(0, tracks.size - 1))
     }
 
     /** 根据播放模式设置播放器的 循环/随机（系统媒体控件上一首/下一首随之正确工作） */
