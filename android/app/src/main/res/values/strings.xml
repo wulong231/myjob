@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">Bili</string>
     <string name="bili23_music_channel">音乐播放</string>
+    <string name="bili23_video_channel">视频播放</string>
 </resources>

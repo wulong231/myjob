@@ -208,12 +208,18 @@ class BiliApi(private val okHttp: OkHttpClient) {
         }
     }
 
-    /** 获取 DASH 播放地址（视频+音频流） */
-    suspend fun getPlayUrl(bvid: String, cid: Long, quality: Int = 100): PlayUrl =
+    /** 获取 DASH 播放地址（视频+音频流）。fnval=4048 放开 4K/HDR/杜比/8K/AV1；
+     *  audioQuality=0 表示自动按优先级选音频流（无损优先、跳过杜比）。 */
+    suspend fun getPlayUrl(
+        bvid: String,
+        cid: Long,
+        quality: Int = 100,
+        audioQuality: Int = AUDIO_QUALITY_AUTO
+    ): PlayUrl =
         withContext(Dispatchers.IO) {
             try {
                 val resp = fetchJson(
-                    "$API_BASE/x/player/wbi/playurl?bvid=${WbiSigner.quote(bvid)}&cid=$cid&qn=$quality&fnval=16&fourk=1"
+                    "$API_BASE/x/player/wbi/playurl?bvid=${WbiSigner.quote(bvid)}&cid=$cid&qn=$quality&fnval=4048&fourk=1"
                 )
                 if (resp.optInt("code") != 0) return@withContext PlayUrl()
                 val d = resp.optJSONObject("data") ?: return@withContext PlayUrl()
@@ -226,6 +232,8 @@ class BiliApi(private val okHttp: OkHttpClient) {
 
                 var videoUrl = ""
                 var audioUrl = ""
+                var pickedAudioId = 0
+                val audioIds = mutableListOf<Int>()
                 val dash = d.optJSONObject("dash")
                 if (dash != null) {
                     val vArr = dash.optJSONArray("video")
@@ -238,20 +246,49 @@ class BiliApi(private val okHttp: OkHttpClient) {
                         videoUrl = best?.optString("baseUrl") ?: ""
                     }
                     val aArr = dash.optJSONArray("audio")
-                    if (aArr != null && aArr.length() > 0) {
-                        var best: JSONObject? = null
+                    val entries = mutableListOf<Pair<Int, JSONObject>>()
+                    if (aArr != null) {
                         for (i in 0 until aArr.length()) {
                             val a = aArr.optJSONObject(i) ?: continue
-                            if (best == null || a.optInt("id") > best!!.optInt("id")) best = a
+                            val aid = a.optInt("id")
+                            audioIds.add(aid)
+                            entries.add(aid to a)
                         }
-                        audioUrl = best?.optString("baseUrl") ?: ""
+                    }
+                    val chosen = pickAudioStream(entries, audioQuality)
+                    if (chosen != null) {
+                        pickedAudioId = chosen.first
+                        audioUrl = chosen.second.optString("baseUrl")
                     }
                 }
-                PlayUrl(d.optInt("quality"), videoUrl, audioUrl, accept)
+                PlayUrl(
+                    quality = d.optInt("quality"),
+                    videoUrl = videoUrl,
+                    audioUrl = audioUrl,
+                    acceptQuality = accept,
+                    audioQuality = pickedAudioId,
+                    audioOptions = AUDIO_QUALITY_OPTIONS.filter { it in audioIds }
+                )
             } catch (_: Exception) {
                 PlayUrl()
             }
         }
+
+    /** 音频流选择：指定档位优先取该档；不可用（未登录/非大会员）时回退自动；
+     *  自动模式按 AUDIO_AUTO_PRIORITY 取最高可用档，全不匹配时兜底取带宽最大档。 */
+    private fun pickAudioStream(
+        entries: List<Pair<Int, JSONObject>>,
+        requested: Int
+    ): Pair<Int, JSONObject>? {
+        if (entries.isEmpty()) return null
+        if (requested != AUDIO_QUALITY_AUTO) {
+            entries.firstOrNull { it.first == requested }?.let { return it }
+        }
+        for (id in AUDIO_AUTO_PRIORITY) {
+            entries.firstOrNull { it.first == id }?.let { return it }
+        }
+        return entries.maxByOrNull { it.second.optLong("bandwidth") }
+    }
 
     private fun cleanTitle(t: String): String = t.replace(Regex("<[^>]+>"), "")
 

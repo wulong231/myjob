@@ -33,6 +33,13 @@ object Settings {
             prefs.edit().putInt("default_quality", value).apply()
         }
 
+    /** 音频音质：0=自动（无损优先、跳过杜比），其余为指定档位码（30251/30250/30280/30232/30216） */
+    var audioQuality: Int
+        get() = prefs.getInt("audio_quality", 0)
+        set(value) {
+            prefs.edit().putInt("audio_quality", value).apply()
+        }
+
     /** 主题模式：0=跟随系统，1=浅色，2=深色 */
     var themeMode: Int
         get() = themeModeState.intValue
@@ -428,6 +435,26 @@ object Settings {
 
     fun setTrackGain(path: String, db: Float) {
         prefs.edit().putFloat("gain_$path", db).apply()
+    }
+
+    /** 均衡器开关（全局，作用于音频播放，即时生效） */
+    var eqEnabled: Boolean
+        get() = prefs.getBoolean("eq_enabled", false)
+        set(value) {
+            prefs.edit().putBoolean("eq_enabled", value).apply()
+        }
+
+    /** 均衡器 10 段增益（dB），CSV 存储，与桌面版 10 频段对齐 */
+    var eqGainsCsv: String
+        get() = prefs.getString("eq_gains", "") ?: ""
+        set(value) {
+            prefs.edit().putString("eq_gains", value).apply()
+        }
+
+    fun getEqGains(): List<Int> = eqGainsCsv.split(',').mapNotNull { it.trim().toIntOrNull() }
+
+    fun setEqGains(gains: List<Int>) {
+        eqGainsCsv = gains.joinToString(",")
     }
 
     /** 是否标记为纯音乐（标记后不自动搜索歌词，歌词固定显示"纯音乐"） */

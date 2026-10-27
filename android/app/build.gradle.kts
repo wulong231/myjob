@@ -12,8 +12,8 @@ android {
         applicationId = "com.bili23.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.2.3"
+        versionCode = 9
+        versionName = "1.2.6"
     }
 
     signingConfigs {

@@ -132,15 +132,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun loadPlayUrl(bvid: String, cid: Long, quality: Int) {
+    fun loadPlayUrl(bvid: String, cid: Long, quality: Int, audioQuality: Int = Settings.audioQuality) {
         viewModelScope.launch {
-            _playUrl.value = api.getPlayUrl(bvid, cid, quality)
+            _playUrl.value = api.getPlayUrl(bvid, cid, quality, audioQuality)
         }
     }
 
     /** 挂起式加载播放地址，供下载/播放按钮直接使用返回值 */
-    suspend fun fetchPlayUrl(bvid: String, cid: Long, quality: Int): PlayUrl {
-        val url = api.getPlayUrl(bvid, cid, quality)
+    suspend fun fetchPlayUrl(
+        bvid: String,
+        cid: Long,
+        quality: Int,
+        audioQuality: Int = Settings.audioQuality
+    ): PlayUrl {
+        val url = api.getPlayUrl(bvid, cid, quality, audioQuality)
         _playUrl.value = url
         return url
     }
@@ -622,15 +627,5 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (changed) Settings.applyPlaylists(type, map)
         }
-    }
-
-    /** 停止音频前台服务（播放视频前调用，避免音视频冲突） */
-    fun stopMusic() {
-        if (!com.bili23.android.service.MusicPlaybackService.serviceActive) return
-        val ctx = getApplication<Application>()
-        val intent = android.content.Intent(ctx, com.bili23.android.service.MusicPlaybackService::class.java).apply {
-            action = com.bili23.android.service.MusicPlaybackService.ACTION_STOP
-        }
-        ctx.startService(intent)
     }
 }

@@ -30,6 +30,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.MediaNotification
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
@@ -187,6 +188,9 @@ class MusicPlaybackService : MediaSessionService() {
     private var gainEq: Equalizer? = null
     private var appliedGain: Float = 0f
     private var appliedGainPath: String = ""
+    /** 均衡器处理器（注入音频 sink）；eqAppliedKey 用于按 400ms 轮询即时同步设置 */
+    private val eqProcessor = EqualizerAudioProcessor()
+    private var eqAppliedKey: String = ""
     /**
      * 前台就绪保护：服务转前台后 15 秒内仍未进入播放（文件异常、列表为空等），
      * 自动停止服务，避免占位通知常驻
@@ -229,6 +233,12 @@ class MusicPlaybackService : MediaSessionService() {
                 (currentPath != appliedGainPath || Settings.getTrackGain(currentPath) != appliedGain)
             ) {
                 applyTrackGain(currentPath)
+            }
+            // 均衡器：开关/增益变化时即时更新处理器（不影响播放器构建，无需重挂效果）
+            val eqKey = Settings.eqEnabled.toString() + "|" + Settings.eqGainsCsv
+            if (eqKey != eqAppliedKey) {
+                eqAppliedKey = eqKey
+                eqProcessor.update(Settings.eqEnabled, Settings.getEqGains())
             }
             // 耳机/蓝牙重新连接后自动续播（因断开而暂停时）
             headsetCheckTicks++
@@ -404,7 +414,8 @@ class MusicPlaybackService : MediaSessionService() {
         setMediaNotificationProvider(BiliNotificationProvider(this))
 
         // 播放器（不使用音频卸载：实测本机 vivo 硬解通道无声，已回退普通解码）
-        player = ExoPlayer.Builder(this).build()
+        // 渲染器工厂注入均衡器处理器，实现 10 段实时 EQ
+        player = ExoPlayer.Builder(this, EqualizerRenderersFactory(this, eqProcessor)).build()
         // 音频焦点：播放时请求焦点，其他 App 播放时自动暂停/降音，恢复后自动续播
         player.setAudioAttributes(AudioAttributes.DEFAULT, true)
         player.addListener(object : Player.Listener {
@@ -507,18 +518,80 @@ class MusicPlaybackService : MediaSessionService() {
      * 例如"ヨルシカ · 定时 15 分后关闭"；未开启定时时保持原样。
      * 每次重建通知都会读取当前剩余分钟，因此倒计时中的分钟变化也会同步。
      */
-    private inner class BiliNotificationProvider(context: Context) : DefaultMediaNotificationProvider(
-        context,
-        { NOTIFICATION_ID },
-        CHANNEL_ID,
-        R.string.bili23_music_channel
-    ) {
-        override fun getNotificationContentText(metadata: MediaMetadata): CharSequence? {
-            val artist = metadata.artist?.toString().orEmpty()
-            val minutes = timerMinutes()
-            if (minutes <= 0) return artist
-            val timerText = "定时 $minutes 分后关闭"
-            return if (artist.isBlank()) timerText else "$artist · $timerText"
+    private inner class BiliNotificationProvider(context: Context) : MediaNotification.Provider {
+
+        /** 通知内容构建委托给 Media3 默认实现，只覆盖歌手行文案 */
+        private val delegate: DefaultMediaNotificationProvider =
+            object : DefaultMediaNotificationProvider(
+                context,
+                { NOTIFICATION_ID },
+                CHANNEL_ID,
+                R.string.bili23_music_channel
+            ) {
+                override fun getNotificationContentText(metadata: MediaMetadata): CharSequence? {
+                    val artist = metadata.artist?.toString().orEmpty()
+                    val minutes = timerMinutes()
+                    if (minutes <= 0) return artist
+                    val timerText = "定时 $minutes 分后关闭"
+                    return if (artist.isBlank()) timerText else "$artist · $timerText"
+                }
+            }
+
+        override fun createNotification(
+            session: MediaSession,
+            mediaButtonPreferences: ImmutableList<CommandButton>,
+            actionFactory: MediaNotification.ActionFactory,
+            onNotificationChanged: MediaNotification.Provider.Callback
+        ): MediaNotification = delegate.createNotification(
+            session,
+            mediaButtonPreferences,
+            actionFactory,
+            object : MediaNotification.Provider.Callback {
+                override fun onNotificationChanged(notification: MediaNotification) {
+                    onNotificationChanged.onNotificationChanged(notification)
+                    // 封面异步加载完成后，Media3 会按"未播放"重新判定前台状态并撤销前台，
+                    // 导致暂停时通知卡被系统清理；这里立刻把服务转回前台
+                    keepForeground(notification)
+                }
+            }
+        )
+
+        override fun handleCustomCommand(
+            session: MediaSession,
+            action: String,
+            extras: Bundle
+        ): Boolean = delegate.handleCustomCommand(session, action, extras)
+    }
+
+    /**
+     * 暂停时也让服务保持前台常驻：Media3 默认只在"正在播放"时转前台，
+     * 暂停后即退出前台，部分机型（vivo OriginOS 等）会因此移除通知卡、
+     * 冻结或回收进程，通知栏 / 控制中心控件随之失效。
+     */
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        super.onUpdateNotification(session, startInForegroundRequired || tracks.isNotEmpty())
+    }
+
+    /** 从最近任务划掉应用时保留服务与通知：暂停状态也能继续从通知栏控制 */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        if (tracks.isEmpty()) {
+            stopPlaybackAndSelf()
+        }
+        // 有曲目在列表中时不停止服务，只有通知栏"关闭"按钮或定时才会停止
+    }
+
+    /** 以媒体通知把服务重新转回前台（暂停保活） */
+    private fun keepForeground(notification: MediaNotification) {
+        if (tracks.isEmpty()) return
+        try {
+            ServiceCompat.startForeground(
+                this,
+                notification.notificationId,
+                notification.notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            )
+        } catch (_: Exception) {
+            // Android 12+ 后台转前台受限时忽略：通知仍以普通通知保留
         }
     }
 
@@ -609,6 +682,8 @@ class MusicPlaybackService : MediaSessionService() {
                 val cover = intent.getStringExtra(EXTRA_COVER) ?: ""
                 // UI 以 startForegroundService 启动：先同步转前台，避免系统前台服务时限崩溃
                 startForegroundImmediately()
+                // 音频开始播放：停止视频服务，避免音视频同时出声
+                MediaArbiter.stopVideo(this)
                 addTrack(Track(path, title, artist, cover))
             }
 
@@ -620,6 +695,8 @@ class MusicPlaybackService : MediaSessionService() {
                 val startIndex = intent.getIntExtra(EXTRA_INDEX, 0)
                 // UI 以 startForegroundService 启动：先同步转前台，避免系统前台服务时限崩溃
                 startForegroundImmediately()
+                // 音频开始播放：停止视频服务，避免音视频同时出声
+                MediaArbiter.stopVideo(this)
                 setPlaylist(paths, titles, artists, covers, startIndex)
             }
 
@@ -631,7 +708,10 @@ class MusicPlaybackService : MediaSessionService() {
 
             ACTION_SEEK -> player.seekTo(intent.getLongExtra(EXTRA_POSITION, 0L))
 
-            ACTION_PLAY -> player.play()
+            ACTION_PLAY -> {
+                MediaArbiter.stopVideo(this)
+                player.play()
+            }
             ACTION_PAUSE -> player.pause()
             ACTION_TOGGLE -> if (player.isPlaying) player.pause() else player.play()
             ACTION_PREV -> skipPrev()

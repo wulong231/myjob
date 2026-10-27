@@ -50,7 +50,9 @@ data class PlayUrl(
     val quality: Int = 0,
     val videoUrl: String = "",
     val audioUrl: String = "",
-    val acceptQuality: List<Int> = emptyList()
+    val acceptQuality: List<Int> = emptyList(),
+    val audioQuality: Int = 0,                  // 实际选中的音频档位（0=未知）
+    val audioOptions: List<Int> = emptyList()   // 本次返回的可选音频档位（按音质降序）
 )
 
 /** 画质码 → 显示名 */
@@ -66,6 +68,24 @@ fun qualityName(qn: Int): String = QUALITY_NAMES[qn] ?: "${qn}P"
 val QUALITY_OPTIONS: List<Int> = listOf(16, 32, 64, 80, 100, 116, 120, 125, 126, 127)
     .reversed().distinctBy { qualityName(it) }.reversed()
 
+/** 音频音质取值：0=自动（无损优先、跳过杜比），其余为指定档位码 */
+const val AUDIO_QUALITY_AUTO = 0
+
+/** 音频档位码 → 显示名（30251 无损 / 30250 杜比 / 30280 192K / 30232 132K / 30216 64K） */
+val AUDIO_QUALITY_NAMES: Map<Int, String> = mapOf(
+    30251 to "Hi-Res 无损", 30250 to "杜比全景声",
+    30280 to "192K", 30232 to "132K", 30216 to "64K"
+)
+
+fun audioQualityName(id: Int): String =
+    AUDIO_QUALITY_NAMES[id] ?: if (id <= 0) "未知" else "$id"
+
+/** 可手动选择的音频档位（含杜比），按音质从高到低 */
+val AUDIO_QUALITY_OPTIONS: List<Int> = listOf(30251, 30250, 30280, 30232, 30216)
+
+/** 自动选流优先级：无损优先，跳过杜比（杜比解码依机型而定，仅手动选用） */
+val AUDIO_AUTO_PRIORITY: List<Int> = listOf(30251, 30280, 30232, 30216)
+
 /** 下载任务 */
 data class DownloadTask(
     val id: String,
@@ -80,7 +100,8 @@ data class DownloadTask(
     val filePath: String = "",
     val error: String = "",
     val speed: Long = 0L,
-    val type: String = TYPE_VIDEO      // video/audio
+    val type: String = TYPE_VIDEO,     // video/audio
+    val audioQuality: Int = 0          // 音频实际档位（仅 type=audio 时有意义）
 ) {
     companion object {
         const val STATUS_PENDING = "pending"

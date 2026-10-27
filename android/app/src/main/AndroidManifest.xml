@@ -48,6 +48,17 @@
             </intent-filter>
         </service>
 
+        <!-- 视频播放前台服务：息屏 / 后台可靠播放，系统媒体会话可直接控制 -->
+        <service
+            android:name=".service.VideoPlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+
         <!-- 接收硬件媒体键（耳机/蓝牙媒体键），转发给 MediaSession -->
         <receiver
             android:name="androidx.media3.session.MediaButtonReceiver"
@@ -56,10 +67,6 @@
                 <action android:name="android.intent.action.MEDIA_BUTTON" />
             </intent-filter>
         </receiver>
-
-        <receiver
-            android:name=".service.VideoNotificationReceiver"
-            android:exported="false" />
 
         <!-- 分类（播放列表）导出文件分享给其他手机用 -->
         <provider

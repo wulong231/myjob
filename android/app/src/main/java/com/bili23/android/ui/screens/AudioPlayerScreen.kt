@@ -4,9 +4,7 @@ import android.content.Intent
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -16,6 +14,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,12 +35,15 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Equalizer
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Fullscreen
@@ -73,6 +75,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -109,12 +112,16 @@ import com.bili23.android.data.LyricLine
 import com.bili23.android.data.Settings
 import com.bili23.android.data.currentLyricIndex
 import com.bili23.android.data.parseLrc
+import com.bili23.android.service.EQ_BAND_LABELS
+import com.bili23.android.service.EQ_GAIN_LIMIT
+import com.bili23.android.service.EQ_PRESETS
 import com.bili23.android.service.MusicPlaybackService
 import com.bili23.android.ui.AppViewModel
 import com.bili23.android.ui.components.CompactIconButton
 import com.bili23.android.ui.components.dragReorderHandle
 import com.bili23.android.ui.components.rememberDragDropListState
 import java.io.File
+import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 
 /** 毫秒 → mm:ss */
@@ -692,6 +699,18 @@ fun AudioPlayerScreen(vm: AppViewModel = viewModel()) {
         } else {
             // 多选拖拽重排（长按项右侧手柄拖动）；网格自适应列数：手机单列，平板横屏多列
             val audioListState = rememberLazyGridState()
+            // 进入列表时定位到正在播放的曲目：等当前曲目就绪后只定位一次，
+            // 之后播放中自动切歌或手动滚动都不再打断
+            var locatedToCurrent by remember { mutableStateOf(false) }
+            LaunchedEffect(displayAudio, currentPath) {
+                if (locatedToCurrent) return@LaunchedEffect
+                val p = currentPath ?: return@LaunchedEffect
+                val idx = displayAudio.indexOfFirst { it.path == p }
+                if (idx >= 0) {
+                    audioListState.scrollToItem(idx)
+                    locatedToCurrent = true
+                }
+            }
             val audioDragState = rememberDragDropListState(audioListState) { from, to ->
                 val fromPath = displayAudio.getOrNull(from)?.path
                 val toPath = displayAudio.getOrNull(to)?.path
@@ -1189,6 +1208,8 @@ private fun NowPlayingCard(
     val context = LocalContext.current
     // 本曲音量调整对话框开关
     var showGainDialog by remember { mutableStateOf(false) }
+    // 均衡器对话框开关
+    var showEqDialog by remember { mutableStateOf(false) }
     // 该曲已保存的增益（非 0 时按钮高亮，提示此曲已被调整过）
     val savedGain = remember(item.path) { Settings.getTrackGain(item.path) }
     Column(
@@ -1296,24 +1317,14 @@ private fun NowPlayingCard(
                 Icon(Icons.Filled.SkipPrevious, contentDescription = "上一首")
             }
             IconButton(onClick = onPlayPause) {
-                val btnScale by animateFloatAsState(
-                    targetValue = if (isPlaying) 1f else 0.82f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                        stiffness = Spring.StiffnessMedium
-                    ),
-                    label = "playButtonScale"
-                )
                 Crossfade(
                     targetState = isPlaying,
-                    modifier = Modifier.scale(btnScale),
                     animationSpec = tween(180),
                     label = "playPauseIcon"
                 ) { playing ->
                     Icon(
                         if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        contentDescription = "播放/暂停",
-                        modifier = Modifier.size(44.dp)
+                        contentDescription = "播放/暂停"
                     )
                 }
             }
@@ -1335,6 +1346,15 @@ private fun NowPlayingCard(
                     Icons.Filled.VolumeUp,
                     contentDescription = "本曲音量",
                     tint = if (savedGain != 0f) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            // 均衡器：10 段 EQ（全局，开启时按钮高亮）
+            IconButton(onClick = { showEqDialog = true }) {
+                Icon(
+                    Icons.Filled.Equalizer,
+                    contentDescription = "均衡器",
+                    tint = if (Settings.eqEnabled) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
@@ -1368,6 +1388,106 @@ private fun NowPlayingCard(
             }
         )
     }
+
+    // 均衡器对话框：改动即时写入设置，由播放服务在 400ms 内应用
+    if (showEqDialog) {
+        EqualizerDialog(onDismiss = { showEqDialog = false })
+    }
+}
+
+/** 均衡器对话框：开关 + 预设曲线 + 10 段增益滑杆（-12~+12 dB，频段与桌面版一致） */
+@Composable
+private fun EqualizerDialog(
+    onDismiss: () -> Unit
+) {
+    val bandCount = EQ_BAND_LABELS.size
+    var enabled by remember { mutableStateOf(Settings.eqEnabled) }
+    var gains by remember {
+        val saved = Settings.getEqGains()
+        mutableStateOf(List(bandCount) { i -> (saved.getOrNull(i) ?: 0).coerceIn(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT) })
+    }
+    var preset by remember { mutableStateOf(EQ_PRESETS.entries.firstOrNull { it.value == gains }?.key.orEmpty()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("均衡器 EQ") },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "启用均衡器",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = {
+                            enabled = it
+                            Settings.eqEnabled = it
+                        }
+                    )
+                }
+                Text(
+                    "10 段（31Hz~16kHz，±12dB），开启时按最大正增益预衰减以避免削波。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                    EQ_PRESETS.forEach { (name, curve) ->
+                        FilterChip(
+                            selected = preset == name,
+                            onClick = {
+                                preset = name
+                                gains = curve
+                                Settings.setEqGains(curve)
+                            },
+                            label = { Text(name) },
+                            modifier = Modifier.padding(end = 6.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                EQ_BAND_LABELS.forEachIndexed { i, label ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.width(34.dp)
+                        )
+                        Slider(
+                            value = gains[i].toFloat(),
+                            onValueChange = { value ->
+                                gains = gains.toMutableList().also { it[i] = value.roundToInt() }
+                                preset = ""
+                            },
+                            onValueChangeFinished = { Settings.setEqGains(gains) },
+                            valueRange = -EQ_GAIN_LIMIT.toFloat()..EQ_GAIN_LIMIT.toFloat(),
+                            steps = EQ_GAIN_LIMIT * 2 - 1,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            "%+d".format(gains[i]),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.width(34.dp)
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("完成") }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                gains = List(bandCount) { 0 }
+                preset = "平直"
+                Settings.setEqGains(gains)
+            }) { Text("重置") }
+        }
+    )
 }
 
 /** 本曲音量调整对话框：-12~+12 dB，按文件路径记忆，只影响当前歌曲 */

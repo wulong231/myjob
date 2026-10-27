@@ -40,14 +40,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
+import com.bili23.android.data.AUDIO_QUALITY_AUTO
+import com.bili23.android.data.AUDIO_QUALITY_OPTIONS
 import com.bili23.android.data.PlaylistTransfer
 import com.bili23.android.data.Settings
+import com.bili23.android.data.audioQualityName
 import com.bili23.android.ui.AppViewModel
 
 @Composable
 fun SettingsScreen(vm: AppViewModel = viewModel(), navController: NavHostController? = null) {
     var showThemeDialog by remember { mutableStateOf(false) }
     var showQualityDialog by remember { mutableStateOf(false) }
+    var showAudioQualityDialog by remember { mutableStateOf(false) }
     var showCookieDialog by remember { mutableStateOf(false) }
     var showLogoutDialog by remember { mutableStateOf(false) }
     var showDirDialog by remember { mutableStateOf(false) }
@@ -99,6 +103,12 @@ fun SettingsScreen(vm: AppViewModel = viewModel(), navController: NavHostControl
             title = "默认画质",
             subtitle = com.bili23.android.data.qualityName(Settings.defaultQuality)
         ) { showQualityDialog = true }
+
+        // 音频音质
+        SettingsItem(
+            title = "音频音质",
+            subtitle = audioQualityLabel(Settings.audioQuality)
+        ) { showAudioQualityDialog = true }
 
         // Cookie（未展示明文，仅提示）
         SettingsItem(
@@ -171,6 +181,19 @@ fun SettingsScreen(vm: AppViewModel = viewModel(), navController: NavHostControl
         ) { index ->
             Settings.defaultQuality = options[index]
             showQualityDialog = false
+        }
+    }
+
+    if (showAudioQualityDialog) {
+        val options = listOf(AUDIO_QUALITY_AUTO) + AUDIO_QUALITY_OPTIONS
+        val labels = options.map { audioQualityLabel(it) }
+        SingleChoiceDialog(
+            title = "音频音质",
+            options = labels,
+            selectedIndex = options.indexOf(Settings.audioQuality).coerceAtLeast(0)
+        ) { index ->
+            Settings.audioQuality = options[index]
+            showAudioQualityDialog = false
         }
     }
 
@@ -318,4 +341,12 @@ private fun themeName(mode: Int): String = when (mode) {
     1 -> "浅色"
     2 -> "深色"
     else -> "跟随系统"
+}
+
+/** 音频音质文案：无损/杜比标注需大会员（杜比另受机型解码限制） */
+private fun audioQualityLabel(value: Int): String = when (value) {
+    AUDIO_QUALITY_AUTO -> "自动（无损优先）"
+    30251 -> "Hi-Res 无损（需大会员）"
+    30250 -> "杜比全景声（需大会员，依机型）"
+    else -> audioQualityName(value)
 }

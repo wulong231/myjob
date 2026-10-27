@@ -48,6 +48,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import coil.compose.AsyncImage
 import com.bili23.android.data.DownloadTask
+import com.bili23.android.data.audioQualityName
 import com.bili23.android.data.qualityName
 import com.bili23.android.ui.AppViewModel
 
@@ -214,7 +215,7 @@ private fun DownloadTaskItem(
                     text = if (task.type == DownloadTask.TYPE_VIDEO) {
                         "${qualityName(task.quality)} · ${task.part}"
                     } else {
-                        "音频 · ${task.part}"
+                        "音频 · ${audioQualityName(task.audioQuality)} · ${task.part}"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant

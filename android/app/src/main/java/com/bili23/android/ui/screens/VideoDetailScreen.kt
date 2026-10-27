@@ -356,7 +356,8 @@ fun VideoDetailScreen(
                                                 part = ep.part,
                                                 cid = ep.cid,
                                                 coverUrl = info.coverUrl,
-                                                audioUrl = url.audioUrl
+                                                audioUrl = url.audioUrl,
+                                                audioQuality = url.audioQuality
                                             )
                                             ok++
                                         }

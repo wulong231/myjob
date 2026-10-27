@@ -143,7 +143,7 @@ class DownloadManager(
         }
     }
 
-    /** 仅下载音频（DASH 音频流 AAC，保存为 M4A 到 audios/ 目录） */
+    /** 仅下载音频（DASH 音频流，保存为 M4A 到 audios/ 目录；音质由 audioQuality 决定） */
     suspend fun downloadAudioOnly(
         bvid: String,
         title: String,
@@ -151,6 +151,7 @@ class DownloadManager(
         cid: Long,
         coverUrl: String,
         audioUrl: String,
+        audioQuality: Int = 0,
         onStatus: (DownloadTask) -> Unit = {}
     ): DownloadTask = withContext(Dispatchers.IO) {
         val name = buildFileName(title, part)
@@ -165,7 +166,8 @@ class DownloadManager(
             quality = 0,
             coverUrl = coverUrl,
             status = DownloadTask.STATUS_DOWNLOADING,
-            type = DownloadTask.TYPE_AUDIO
+            type = DownloadTask.TYPE_AUDIO,
+            audioQuality = audioQuality
         )
         _tasks.value = _tasks.value.filter { it.id != id } + task
         onStatus(task)

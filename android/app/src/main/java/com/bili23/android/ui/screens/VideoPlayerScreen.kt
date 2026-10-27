@@ -1,8 +1,8 @@
 package com.bili23.android.ui.screens
 
-import androidx.activity.compose.BackHandler
+import android.content.Intent
 import android.content.res.Configuration
-import android.net.Uri
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -48,7 +49,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -68,26 +68,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
-import androidx.media3.common.AudioAttributes
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.MergingMediaSource
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import com.bili23.android.data.BiliApi
 import com.bili23.android.data.PlayUrl
 import com.bili23.android.data.Settings
 import com.bili23.android.data.qualityName
+import com.bili23.android.service.VideoPlaybackService
 import com.bili23.android.ui.AppViewModel
 import com.bili23.android.ui.applySystemBarTheme
 import com.bili23.android.ui.isDarkThemeNow
 import java.io.File
-import kotlin.random.Random
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -98,6 +90,12 @@ private fun formatVideoMs(ms: Long): String {
     return "%d:%02d".format(total / 60, total % 60)
 }
 
+/**
+ * 视频播放页（界面层）：
+ * 播放内核由 [VideoPlaybackService]（Media3 MediaSessionService）持有，本页只做
+ * 渲染（PlayerView 绑定服务播放器）、控制（发送 Intent 指令）与状态展示（轮询服务状态）。
+ * 这样息屏 / 后台可继续播放，且能接入系统媒体会话（锁屏 / 控制中心 / AOD / 蓝牙媒体键）。
+ */
 @androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -106,7 +104,6 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
     val currentPlay by vm.currentPlay.collectAsState()
     val localPath by vm.localPlayPath.collectAsState()
     val videoQueue by vm.videoQueue.collectAsState()
-    val videoQueueIndex by vm.videoQueueIndex.collectAsState()
     val tasks by vm.downloadManager.tasks.collectAsState()
     val play = currentPlay?.third ?: PlayUrl()
     val isLocal = localPath != null
@@ -128,31 +125,39 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
             else list
         }
     }
-    // 播放模式：0=顺序 1=列表循环 2=单曲循环 3=随机
-    var playMode by remember { mutableIntStateOf(Settings.videoPlayMode) }
-    val inQueue = videoQueue.size > 1
+    // 交给服务播放的本地队列：已有播放队列则用它，否则用当前展示的全部本地视频（与旧版一致）
+    val localQueue = if (!isLocal) emptyList()
+    else if (videoQueue.size > 1) videoQueue
+    else allLocalVideos
 
-    // 在线播放选集（来自详情页已加载的视频信息；若进入播放器时未加载则重新拉取）
+    // 在线播放：进入播放页时若详情页尚未加载，重新拉取（用于展示选集列表）
     val videoInfo by vm.videoInfo.collectAsState()
     val onlineEpisodes = if (!isLocal) (videoInfo?.episodes ?: emptyList()) else emptyList()
-    val onlineIndex = onlineEpisodes.indexOfFirst { it.cid == currentPlay?.second }
     LaunchedEffect(currentPlay?.first, isLocal) {
         val bvid = currentPlay?.first
-        if (!isLocal && bvid != null && videoInfo?.bvid != bvid) {
-            vm.loadVideoDetail(bvid)
-        }
+        if (!isLocal && bvid != null && videoInfo?.bvid != bvid) vm.loadVideoDetail(bvid)
     }
 
-    // 可切换的视频集合：本地用队列/本地列表；在线用该视频的选集（分P）
-    val navVideos = if (!isLocal) emptyList()
-    else if (inQueue) videoQueue
-    else allLocalVideos
-    val navIndex = if (!isLocal) 0
-    else if (inQueue) videoQueueIndex
-    else allLocalVideos.indexOf(localPath).coerceAtLeast(0)
-    val canNav = if (isLocal) navVideos.size > 1 else onlineEpisodes.size > 1
+    // 本次播放内容标识：与服务当前内容一致时只绑定界面，不重新开始播放
+    val desiredKey = if (isLocal) "local:${localPath ?: ""}"
+    else "online:${currentPlay?.first ?: ""}:${currentPlay?.second ?: 0L}"
 
-    var player by remember { mutableStateOf<ExoPlayer?>(null) }
+    // ---- 服务状态（轮询同步） ----
+    var playMode by remember { mutableIntStateOf(VideoPlaybackService.playMode) }
+    var position by remember { mutableLongStateOf(0L) }
+    var duration by remember { mutableLongStateOf(0L) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var buffering by remember { mutableStateOf(false) }
+    var errorMsg by remember { mutableStateOf("") }
+    var curIndex by remember { mutableIntStateOf(0) }
+    var queueCount by remember { mutableIntStateOf(1) }
+    var hasNav by remember { mutableStateOf(false) }
+    var curLocalPath by remember { mutableStateOf("") }
+    var curCid by remember { mutableLongStateOf(0L) }
+    var curTitle by remember { mutableStateOf("") }
+    /** PlayerView 绑定的播放器实例（服务创建后通过轮询/启动等待取回） */
+    var uiPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
+
     var manualFullscreen by remember { mutableStateOf(false) }
     val isFullscreen = (!isTablet && isLandscape) || manualFullscreen
 
@@ -164,14 +169,82 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
     val scope = rememberCoroutineScope()
     var hideJob by remember { mutableStateOf<Job?>(null) }
 
+    // 收藏状态（仅本地视频）：以服务当前播放的本地文件为准
+    var favState by remember(curLocalPath) { mutableStateOf(Settings.isFavorite(curLocalPath)) }
+
+    /** 向视频服务发送指令（仅用于控制指令；开始播放由 startPlayback 处理） */
+    fun cmd(action: String, block: Intent.() -> Unit = {}) {
+        context.startService(
+            Intent(context, VideoPlaybackService::class.java).apply {
+                this.action = action
+                block()
+            }
+        )
+    }
+
+    /** 发起播放：本地提交队列 + 起始序号；在线提交 bvid/cid 与已取到的播放地址 */
+    fun startPlayback() {
+        if (isLocal) {
+            val path = localPath ?: return
+            // 队列为空（如已清理下载记录、只剩磁盘文件）时退化为单曲播放，保证一定能播
+            val queue = if (localQueue.contains(path)) localQueue else listOf(path)
+            val index = queue.indexOf(path).coerceAtLeast(0)
+            cmd(VideoPlaybackService.ACTION_PLAY_LOCAL) {
+                putStringArrayListExtra(VideoPlaybackService.EXTRA_PATHS, ArrayList(queue))
+                putExtra(VideoPlaybackService.EXTRA_INDEX, index)
+            }
+        } else {
+            val bvid = currentPlay?.first ?: return
+            val cid = currentPlay?.second ?: return
+            cmd(VideoPlaybackService.ACTION_PLAY_ONLINE) {
+                putExtra(VideoPlaybackService.EXTRA_BVID, bvid)
+                putExtra(VideoPlaybackService.EXTRA_CID, cid)
+                putExtra(VideoPlaybackService.EXTRA_TITLE, videoInfo?.title ?: "")
+                putExtra(VideoPlaybackService.EXTRA_COVER, videoInfo?.coverUrl ?: "")
+                putExtra(VideoPlaybackService.EXTRA_QUALITY, play.quality)
+                putExtra(VideoPlaybackService.EXTRA_VIDEO_URL, play.videoUrl)
+                putExtra(VideoPlaybackService.EXTRA_AUDIO_URL, play.audioUrl)
+            }
+        }
+    }
+
+    /** 退出播放页：停止播放并返回（息屏 / Home 键离开则继续后台播放） */
+    fun exitPlayer() {
+        // 先解绑 PlayerView，避免播放器销毁后视图仍引用
+        uiPlayer = null
+        if (VideoPlaybackService.serviceActive) cmd(VideoPlaybackService.ACTION_STOP)
+        navController.popBackStack()
+    }
+
+    /** 在线切换分P：拉取地址后交给播放页重新发起播放 */
+    fun playOnlineEpisode(cid: Long) {
+        if (cid <= 0) return
+        val bvid = currentPlay?.first ?: return
+        val q = play.quality
+        scope.launch {
+            val url = vm.fetchPlayUrl(bvid, cid, q)
+            if (url.videoUrl.isNotEmpty()) vm.setCurrentPlay(bvid, cid, url)
+        }
+    }
+
+    fun cycleMode() {
+        val next = (playMode + 1) % 4
+        playMode = next
+        Settings.videoPlayMode = next
+        if (VideoPlaybackService.serviceActive) {
+            cmd(VideoPlaybackService.ACTION_SET_MODE) {
+                putExtra(VideoPlaybackService.EXTRA_MODE, next)
+            }
+        }
+    }
+
     fun pokeControls() {
         controlsVisible = true
         if (!isFullscreen) return
         hideJob?.cancel()
         hideJob = scope.launch {
             delay(3000)
-            val p = player
-            if (p?.isPlaying == true) controlsVisible = false
+            if (VideoPlaybackService.isPlaying) controlsVisible = false
         }
     }
 
@@ -184,237 +257,48 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
         }
     }
 
+    // 进入播放页：若服务未在播放同一内容则发起播放，并把服务播放器绑定给 PlayerView
+    LaunchedEffect(desiredKey, localQueue.size) {
+        if (isLocal && localPath == null) return@LaunchedEffect
+        val bound = VideoPlaybackService.serviceActive &&
+                VideoPlaybackService.currentMediaKey == desiredKey
+        if (!bound) startPlayback()
+        var tries = 0
+        while (uiPlayer == null && tries < 60) {
+            uiPlayer = VideoPlaybackService.playerForUi
+            if (uiPlayer == null) {
+                delay(50)
+                tries++
+            }
+        }
+    }
+
+    // 轮询服务状态（进度 / 播放态 / 队列位置 / 定时 / 错误）
+    LaunchedEffect(desiredKey) {
+        while (true) {
+            playMode = if (VideoPlaybackService.serviceActive) VideoPlaybackService.playMode
+            else Settings.videoPlayMode
+            position = VideoPlaybackService.position
+            duration = VideoPlaybackService.duration
+            isPlaying = VideoPlaybackService.isPlaying
+            buffering = VideoPlaybackService.isBuffering
+            errorMsg = VideoPlaybackService.lastError
+            curIndex = VideoPlaybackService.currentIndex
+            queueCount = VideoPlaybackService.queueCount
+            hasNav = VideoPlaybackService.hasQueueNav
+            curLocalPath = if (VideoPlaybackService.isLocal) VideoPlaybackService.currentLocalPath else ""
+            curCid = VideoPlaybackService.currentCid
+            curTitle = VideoPlaybackService.currentTitle
+            if (uiPlayer == null) uiPlayer = VideoPlaybackService.playerForUi
+            delay(500)
+        }
+    }
+
     // 全屏进入/退出时重置控制条显隐
     LaunchedEffect(isFullscreen) {
         if (isFullscreen) pokeControls() else {
             hideJob?.cancel()
             controlsVisible = true
-        }
-    }
-
-    // 播放进度/状态（用于自绘控制条）
-    var posMs by remember { mutableLongStateOf(0L) }
-    var durMs by remember { mutableLongStateOf(0L) }
-    var isVideoPlaying by remember { mutableStateOf(false) }
-
-    // 收藏状态（仅本地视频）
-    val localPathForFav = localPath
-    var favState by remember(localPathForFav) { mutableStateOf(Settings.isFavorite(localPathForFav ?: "")) }
-
-    // 本地路径优先，其次在线 DASH
-    val playKey = if (isLocal) "local:$localPath" else play.videoUrl
-
-    fun syncPlayerState() {
-        val p = player
-        if (p != null) {
-            posMs = p.currentPosition
-            durMs = p.duration.coerceAtLeast(0L)
-            isVideoPlaying = p.isPlaying
-        }
-    }
-
-    /** 在线播放指定分P（拉取地址后切换，不经过本地队列） */
-    fun playOnlineEpisode(cid: Long) {
-        if (cid <= 0) return
-        val bvid = currentPlay?.first ?: return
-        val q = play.quality
-        scope.launch {
-            val url = vm.fetchPlayUrl(bvid, cid, q)
-            if (url.videoUrl.isNotEmpty()) {
-                vm.setCurrentPlay(bvid, cid, url)
-            }
-        }
-    }
-
-    fun onVideoEnded() {
-        if (!canNav) {
-            if (playMode == 2) { // 单曲循环
-                player?.seekTo(0)
-                player?.play()
-            }
-            return
-        }
-        if (!isLocal) {
-            // 在线多P自动连播
-            when (playMode) {
-                2 -> {
-                    player?.seekTo(0)
-                    player?.play()
-                }
-
-                1 -> {
-                    if (onlineIndex < onlineEpisodes.size - 1)
-                        playOnlineEpisode(onlineEpisodes[onlineIndex + 1].cid)
-                    else playOnlineEpisode(onlineEpisodes.firstOrNull()?.cid ?: 0)
-                }
-
-                else -> {
-                    if (onlineIndex < onlineEpisodes.size - 1)
-                        playOnlineEpisode(onlineEpisodes[onlineIndex + 1].cid)
-                    else {
-                        player?.seekTo(0)
-                        player?.pause()
-                    }
-                }
-            }
-            return
-        }
-        when (playMode) {
-            2 -> { // 单曲循环
-                player?.seekTo(0)
-                player?.play()
-            }
-
-            3 -> { // 随机
-                if (navVideos.size > 1) {
-                    var n = Random.nextInt(navVideos.size)
-                    while (n == navIndex) n = Random.nextInt(navVideos.size)
-                    vm.setVideoQueue(navVideos, n)
-                } else {
-                    player?.seekTo(0)
-                    player?.play()
-                }
-            }
-
-            0 -> { // 顺序：播完末尾即停止
-                if (navIndex < navVideos.size - 1) {
-                    vm.setVideoQueue(navVideos, navIndex + 1)
-                } else {
-                    player?.seekTo(0)
-                    player?.pause()
-                }
-            }
-
-            else -> { // 列表循环
-                vm.setVideoQueue(navVideos, (navIndex + 1) % navVideos.size)
-            }
-        }
-    }
-
-    fun nextVideo() {
-        if (!canNav) return
-        if (!isLocal) {
-            val next = onlineEpisodes.getOrNull(onlineIndex + 1) ?: return
-            playOnlineEpisode(next.cid)
-            return
-        }
-        when (playMode) {
-            3 -> {
-                if (navVideos.size > 1) {
-                    var n = Random.nextInt(navVideos.size)
-                    while (n == navIndex) n = Random.nextInt(navVideos.size)
-                    vm.setVideoQueue(navVideos, n)
-                }
-            }
-
-            0 -> {
-                if (navIndex < navVideos.size - 1) vm.setVideoQueue(navVideos, navIndex + 1)
-                else vm.setVideoQueue(navVideos, 0)
-            }
-
-            else -> vm.setVideoQueue(navVideos, (navIndex + 1) % navVideos.size)
-        }
-    }
-
-    fun prevVideo() {
-        if (!canNav) return
-        if (!isLocal) {
-            val prev = onlineEpisodes.getOrNull(onlineIndex - 1) ?: return
-            playOnlineEpisode(prev.cid)
-            return
-        }
-        if (posMs > 3000) {
-            player?.seekTo(0)
-            return
-        }
-        vm.setVideoQueue(navVideos, if (navIndex <= 0) navVideos.size - 1 else navIndex - 1)
-    }
-
-    fun cycleMode() {
-        playMode = (playMode + 1) % 4
-        Settings.videoPlayMode = playMode
-    }
-
-    /** 绑定视频通知控制器：通知栏按钮可控制当前播放器 */
-    fun bindVideoNotification(p: ExoPlayer) {
-        com.bili23.android.service.VideoMediaController.player = p
-        com.bili23.android.service.VideoMediaController.onNext = { nextVideo() }
-        com.bili23.android.service.VideoMediaController.onPrev = { prevVideo() }
-        com.bili23.android.service.VideoMediaController.onStop = {
-            p.stop()
-            navController.popBackStack()
-        }
-        com.bili23.android.service.VideoMediaController.title =
-            if (isLocal) (localPath ?: "").substringAfterLast('/')
-            else (videoInfo?.title?.ifBlank { null } ?: "视频播放")
-        com.bili23.android.service.VideoMediaController.subtitle =
-            if (!canNav) ""
-            else if (isLocal) "${navIndex + 1}/${navVideos.size}"
-            else "${onlineIndex + 1}/${onlineEpisodes.size}"
-        com.bili23.android.service.VideoMediaNotification.update()
-    }
-
-    // 构建播放器（含队列自动切集）
-    DisposableEffect(playKey, videoQueueIndex) {
-        // 播放视频前停止音频服务，避免音视频同时播放
-        vm.stopMusic()
-        // 初始化视频通知系统（可后台控制播放/暂停）
-        com.bili23.android.service.VideoMediaNotification.init(context)
-        if (isLocal && localPath != null) {
-            val f = File(localPath!!)
-            if (f.exists()) {
-                val newPlayer = ExoPlayer.Builder(context).build()
-                // 音频焦点：避免与其他 App 的音乐播放冲突（被抢占时暂停/降音，恢复后续播）
-                newPlayer.setAudioAttributes(AudioAttributes.DEFAULT, true)
-                newPlayer.addListener(object : Player.Listener {
-                    override fun onPlaybackStateChanged(playbackState: Int) {
-                        syncPlayerState()
-                        if (playbackState == Player.STATE_ENDED) onVideoEnded()
-                    }
-
-                    override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        syncPlayerState()
-                    }
-                })
-                newPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(f)))
-                newPlayer.prepare()
-                newPlayer.playWhenReady = true
-                player = newPlayer
-                bindVideoNotification(newPlayer)
-            }
-        } else if (play.videoUrl.isNotEmpty()) {
-            val newPlayer = buildBiliPlayer(context, play)
-            player = newPlayer
-            newPlayer.prepare()
-            newPlayer.playWhenReady = true
-            bindVideoNotification(newPlayer)
-        }
-        onDispose {
-            player?.release()
-            player = null
-            com.bili23.android.service.VideoMediaNotification.cancel()
-            com.bili23.android.service.VideoMediaController.reset()
-        }
-    }
-
-    // 轮询播放进度（用于自绘控制条 + 同步通知栏）
-    LaunchedEffect(playKey) {
-        var notifyTicks = 0
-        while (true) {
-            syncPlayerState()
-            // 每约 2 秒刷新一次通知栏状态/进度
-            notifyTicks++
-            if (notifyTicks % 4 == 0) {
-                com.bili23.android.service.VideoMediaController.title =
-                    if (isLocal) (localPath ?: "").substringAfterLast('/')
-                    else (videoInfo?.title?.ifBlank { null } ?: "视频播放")
-                com.bili23.android.service.VideoMediaController.subtitle =
-                    if (!canNav) ""
-                    else if (isLocal) "${navIndex + 1}/${navVideos.size}"
-                    else "${onlineIndex + 1}/${onlineEpisodes.size}"
-                com.bili23.android.service.VideoMediaNotification.update()
-            }
-            kotlinx.coroutines.delay(500)
         }
     }
 
@@ -459,10 +343,9 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
             else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
 
-    // 全屏/横屏时拦截系统返回手势（左划边缘返回）：先退回竖屏播放界面，而不是直接退出播放器
-    BackHandler(enabled = isFullscreen) {
-        exitFullscreen()
-    }
+    // 全屏/横屏时拦截返回：先退回竖屏播放界面；竖屏时返回=退出播放（停止后台播放）
+    BackHandler(enabled = isFullscreen) { exitFullscreen() }
+    BackHandler(enabled = !isFullscreen) { exitPlayer() }
 
     Scaffold(
         topBar = {
@@ -471,18 +354,16 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                     title = {
                         Text(
                             when {
-                                canNav && isLocal -> "${navIndex + 1}/${navVideos.size}"
-                                canNav -> "${onlineIndex + 1}/${onlineEpisodes.size}"
+                                hasNav -> "${curIndex + 1}/$queueCount"
                                 isLocal -> "本地视频"
-                                else -> "播放"
-                            }
+                                else -> curTitle.ifBlank { "播放" }
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     },
                     navigationIcon = {
-                        IconButton(onClick = {
-                            player?.stop()
-                            navController.popBackStack()
-                        }) {
+                        IconButton(onClick = { exitPlayer() }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                         }
                     },
@@ -490,10 +371,10 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                         if (isLocal) {
                             // 收藏切换
                             IconButton(onClick = {
-                                val path = localPath ?: return@IconButton
+                                if (curLocalPath.isEmpty()) return@IconButton
                                 val newFav = !favState
                                 favState = newFav
-                                Settings.setFavorite(path, newFav)
+                                Settings.setFavorite(curLocalPath, newFav)
                             }) {
                                 Icon(
                                     if (favState) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
@@ -503,12 +384,9 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                                 )
                             }
                             IconButton(onClick = {
-                                val path = localPath
-                                if (path != null) {
-                                    player?.stop()
-                                    vm.deleteVideoFile(path)
-                                    navController.popBackStack()
-                                }
+                                val path = curLocalPath.ifBlank { localPath ?: return@IconButton }
+                                exitPlayer()
+                                vm.deleteVideoFile(path)
                             }) {
                                 Icon(Icons.Filled.Delete, contentDescription = "删除", tint = MaterialTheme.colorScheme.error)
                             }
@@ -535,15 +413,7 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                         else Modifier.padding(padding)
                     )
             ) {
-                val hasSource = (isLocal && File(localPath ?: "").exists()) || play.videoUrl.isNotEmpty()
-                if (!hasSource) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("未获取到播放地址", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    return@Column
-                }
-
-                // 视频画面：全屏/横屏铺满，否则 16:9（全屏时点击切换控制条显隐）
+                // 视频画面：全屏/横屏铺满，否则保持原始高度（点击切换控制条 / 双击播放暂停）
                 Box(
                     modifier = (if (isFullscreen) {
                         Modifier
@@ -555,13 +425,11 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                     })
                         .background(Color.Black)
                         .pointerInput(Unit) {
-                            // 单击切控制条（全屏时），双击播放/暂停
                             detectTapGestures(
                                 onTap = { if (isFullscreen) toggleControls() },
                                 onDoubleTap = {
-                                    val p = player
-                                    if (p != null) {
-                                        if (p.isPlaying) p.pause() else p.play()
+                                    if (VideoPlaybackService.serviceActive) {
+                                        cmd(VideoPlaybackService.ACTION_TOGGLE)
                                     }
                                 }
                             )
@@ -577,36 +445,54 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                         },
                         modifier = Modifier.fillMaxWidth(),
                         update = { view ->
-                            val p = player
-                            if (p != null && view.player !== p) {
-                                view.player = p
-                            }
+                            val p = uiPlayer
+                            if (p != null && view.player !== p) view.player = p
                             // 裁切铺满 / 适应屏幕
                             view.resizeMode = if (cropFill)
                                 AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                             else AspectRatioFrameLayout.RESIZE_MODE_FIT
-                        }
+                        },
+                        // 视图离开时解绑，避免引用已释放的播放器
+                        onRelease = { it.player = null }
                     )
+                    // 缓冲 / 拉取播放地址时显示加载圈
+                    if (buffering && errorMsg.isBlank()) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.align(Alignment.Center).size(36.dp),
+                            color = Color.White
+                        )
+                    }
+                    // 播放失败：提示并可原地重试
+                    if (errorMsg.isNotBlank()) {
+                        Column(
+                            modifier = Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(errorMsg, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+                            TextButton(onClick = { startPlayback() }) { Text("重试") }
+                        }
+                    }
                 }
 
                 // 非全屏：控制条 + 信息区
                 if (!isFullscreen) {
                     VideoControlsBar(
-                        isPlaying = isVideoPlaying,
-                        position = posMs,
-                        duration = durMs,
+                        isPlaying = isPlaying,
+                        position = position,
+                        duration = duration,
                         playMode = playMode,
-                        showQueueNav = canNav,
+                        showQueueNav = hasNav,
                         overlay = false,
                         cropFill = cropFill,
                         onToggleResize = { cropFill = !cropFill },
-                        onPlayPause = {
-                            val p = player ?: return@VideoControlsBar
-                            if (p.isPlaying) p.pause() else p.play()
+                        onPlayPause = { cmd(VideoPlaybackService.ACTION_TOGGLE) },
+                        onPrev = { cmd(VideoPlaybackService.ACTION_PREV) },
+                        onNext = { cmd(VideoPlaybackService.ACTION_NEXT) },
+                        onSeek = { pos ->
+                            cmd(VideoPlaybackService.ACTION_SEEK) {
+                                putExtra(VideoPlaybackService.EXTRA_POSITION, pos)
+                            }
                         },
-                        onPrev = { prevVideo() },
-                        onNext = { nextVideo() },
-                        onSeek = { player?.seekTo(it) },
                         onCycleMode = { cycleMode() }
                     )
                     Column(
@@ -617,8 +503,10 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                     ) {
                         if (isLocal) {
                             Text(
-                                text = (localPath ?: "").substringAfterLast('/'),
-                                style = MaterialTheme.typography.titleMedium
+                                text = (curLocalPath.ifBlank { localPath ?: "" }).substringAfterLast('/'),
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
                             )
                             // 已下载视频列表（点击切换播放）
                             if (allLocalVideos.isNotEmpty()) {
@@ -629,7 +517,7 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                                 )
                                 Spacer(Modifier.height(4.dp))
                                 allLocalVideos.forEachIndexed { idx, p ->
-                                    val isCurrent = p == localPath
+                                    val isCurrent = p == curLocalPath
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -664,12 +552,14 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                             }
                         } else {
                             Text(
-                                text = "画质：${qualityName(play.quality)}",
-                                style = MaterialTheme.typography.titleMedium
+                                text = curTitle.ifBlank { videoInfo?.title ?: "" },
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                text = "当前以分离式 DASH 流播放（视频+音频已自动合并）",
+                                text = "画质：${qualityName(play.quality)}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -682,7 +572,7 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                                 )
                                 Spacer(Modifier.height(4.dp))
                                 onlineEpisodes.forEach { ep ->
-                                    val isCurrent = ep.cid == currentPlay?.second
+                                    val isCurrent = ep.cid == curCid
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -735,21 +625,22 @@ fun VideoPlayerScreen(navController: NavHostController, vm: AppViewModel = viewM
                     )
                 }
                 VideoControlsBar(
-                    isPlaying = isVideoPlaying,
-                    position = posMs,
-                    duration = durMs,
+                    isPlaying = isPlaying,
+                    position = position,
+                    duration = duration,
                     playMode = playMode,
-                    showQueueNav = canNav,
+                    showQueueNav = hasNav,
                     overlay = true,
                     cropFill = cropFill,
                     onToggleResize = { cropFill = !cropFill },
-                    onPlayPause = {
-                        val p = player ?: return@VideoControlsBar
-                        if (p.isPlaying) p.pause() else p.play()
+                    onPlayPause = { cmd(VideoPlaybackService.ACTION_TOGGLE) },
+                    onPrev = { cmd(VideoPlaybackService.ACTION_PREV) },
+                    onNext = { cmd(VideoPlaybackService.ACTION_NEXT) },
+                    onSeek = { pos ->
+                        cmd(VideoPlaybackService.ACTION_SEEK) {
+                            putExtra(VideoPlaybackService.EXTRA_POSITION, pos)
+                        }
                     },
-                    onPrev = { prevVideo() },
-                    onNext = { nextVideo() },
-                    onSeek = { player?.seekTo(it) },
                     onCycleMode = { cycleMode() },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -882,45 +773,4 @@ private fun VideoControlsBar(
             modifier = Modifier.fillMaxWidth()
         )
     }
-}
-
-@androidx.annotation.OptIn(UnstableApi::class)
-private fun buildBiliPlayer(context: android.content.Context, play: PlayUrl): ExoPlayer {
-    val dataSourceFactory = DefaultHttpDataSource.Factory()
-        .setUserAgent(BiliApi.USER_AGENT)
-        .setDefaultRequestProperties(
-            mapOf(
-                "Referer" to "https://www.bilibili.com/",
-                "Origin" to "https://www.bilibili.com"
-            )
-        )
-        .setAllowCrossProtocolRedirects(true)
-
-    val player = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(
-            androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory)
-        )
-        .build()
-    // 音频焦点：避免与其他 App 的音乐播放冲突（被抢占时暂停/降音，恢复后续播）
-    player.setAudioAttributes(AudioAttributes.DEFAULT, true)
-
-    val videoItem = MediaItem.Builder()
-        .setUri(Uri.parse(play.videoUrl))
-        .setMimeType(MimeTypes.VIDEO_MP4)
-        .build()
-    val audioItem = MediaItem.Builder()
-        .setUri(Uri.parse(play.audioUrl))
-        .setMimeType(MimeTypes.AUDIO_AAC)
-        .build()
-
-    if (play.audioUrl.isNotEmpty()) {
-        val source = MergingMediaSource(
-            ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(videoItem),
-            ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(audioItem)
-        )
-        player.setMediaSource(source)
-    } else {
-        player.setMediaItem(videoItem)
-    }
-    return player
 }
